@@ -1,11 +1,45 @@
 import JSZip from 'jszip';
+import { XMLBuilder, XMLParser } from 'fast-xml-parser';
+
+type OrderedNode = Record<string, unknown>;
+type OrderedNodes = OrderedNode[];
+
+interface ParagraphCursor {
+  index: number;
+  values: string[];
+}
+
+interface ExportParagraphGroups {
+  body: string[];
+  headers: string[];
+  footers: string[];
+}
+
+const orderedXmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  textNodeName: '#text',
+  preserveOrder: true,
+  ignoreDeclaration: true,
+});
+
+const orderedXmlBuilder = new XMLBuilder({
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  textNodeName: '#text',
+  preserveOrder: true,
+  suppressEmptyNode: false,
+  format: true,
+  indentBy: '  ',
+});
 
 /**
  * Export edited content back to HWPX format.
  *
  * Strategy:
- * - If we have the original HWPX zip data, clone it and replace section content
- * - Otherwise, create a minimal HWPX structure
+ * - HWPX: keep the original package and patch paragraph text back into the
+ *   original XML files so tables/images/layout survive the round-trip.
+ * - HWP: create a minimal HWPX package as a fallback.
  */
 export async function exportToHwpx(
   html: string,
@@ -22,25 +56,168 @@ async function exportWithOriginalStructure(
   originalZipData: ArrayBuffer
 ): Promise<Blob> {
   const zip = await JSZip.loadAsync(originalZipData);
-  const sectionContent = htmlToHwpxSection(html);
+  const groups = extractParagraphGroupsFromHtml(html);
+  const manifestXmlRefs = await collectManifestXmlRefs(zip);
+  const sectionPaths = mergeOrderedPaths(
+    manifestXmlRefs.filter(isSectionXmlPath),
+    collectZipPaths(zip, /Contents\/sec\d+\.xml$/i, /Contents\/section\d+\.xml$/i)
+  );
+  const headerPaths = mergeOrderedPaths(
+    manifestXmlRefs.filter((path) => /(?:^|\/)[^/]*header[^/]*\.xml$/i.test(path)),
+    collectZipPaths(zip, /Contents\/[^/]*header[^/]*\.xml$/i)
+  );
+  const footerPaths = mergeOrderedPaths(
+    manifestXmlRefs.filter((path) => /(?:^|\/)[^/]*footer[^/]*\.xml$/i.test(path)),
+    collectZipPaths(zip, /Contents\/[^/]*footer[^/]*\.xml$/i)
+  );
 
-  const sectionPaths: string[] = [];
-  zip.forEach((path) => {
-    if (path.match(/Contents\/sec\d+\.xml$/i) || path.match(/Contents\/section\d+\.xml$/i)) {
-      sectionPaths.push(path);
-    }
-  });
+  const headerCursor: ParagraphCursor = { index: 0, values: groups.headers };
+  const bodyCursor: ParagraphCursor = { index: 0, values: groups.body };
+  const footerCursor: ParagraphCursor = { index: 0, values: groups.footers };
 
-  if (sectionPaths.length > 0) {
-    zip.file(sectionPaths[0], sectionContent);
-    for (let i = 1; i < sectionPaths.length; i++) {
-      zip.remove(sectionPaths[i]);
-    }
+  for (const path of headerPaths) {
+    await patchXmlFileText(zip, path, headerCursor);
+  }
+
+  if (sectionPaths.length === 0) {
+    zip.file('Contents/sec0.xml', htmlToHwpxSection(html));
   } else {
-    zip.file('Contents/sec0.xml', sectionContent);
+    for (const path of sectionPaths) {
+      await patchXmlFileText(zip, path, bodyCursor);
+    }
+  }
+
+  for (const path of footerPaths) {
+    await patchXmlFileText(zip, path, footerCursor);
   }
 
   return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+}
+
+async function patchXmlFileText(
+  zip: JSZip,
+  path: string,
+  cursor: ParagraphCursor
+): Promise<void> {
+  if (cursor.index >= cursor.values.length) return;
+
+  const file = zip.file(path);
+  if (!file) return;
+
+  const xml = await file.async('string');
+  const nextXml = patchXmlParagraphText(xml, cursor);
+  if (nextXml !== xml) {
+    zip.file(path, nextXml);
+  }
+}
+
+function patchXmlParagraphText(xml: string, cursor: ParagraphCursor): string {
+  try {
+    const declaration = xml.match(/^\s*<\?xml[^>]*\?>\s*/)?.[0] ?? '';
+    const parsed = orderedXmlParser.parse(xml) as OrderedNodes;
+    const paragraphs = collectParagraphNodes(parsed);
+    const startIndex = cursor.index;
+
+    for (const paragraph of paragraphs) {
+      if (cursor.index >= cursor.values.length) break;
+      patchParagraphNodeText(paragraph, cursor.values[cursor.index]);
+      cursor.index += 1;
+    }
+
+    if (cursor.index === startIndex) return xml;
+    return `${declaration}${orderedXmlBuilder.build(parsed)}`;
+  } catch {
+    return xml;
+  }
+}
+
+function collectParagraphNodes(nodes: OrderedNodes, out: OrderedNode[] = []): OrderedNode[] {
+  for (const node of nodes) {
+    const name = getNodeName(node);
+    if (!name) continue;
+
+    if (isParagraphTag(name)) {
+      out.push(node);
+      continue;
+    }
+
+    collectParagraphNodes(getNodeChildren(node), out);
+  }
+
+  return out;
+}
+
+function patchParagraphNodeText(paragraph: OrderedNode, nextText: string): void {
+  const textNodes = collectTextLeafNodes(paragraph);
+  const normalizedText = normalizePatchedText(nextText);
+
+  if (textNodes.length === 0) {
+    ensureParagraphTextNode(paragraph, normalizedText);
+    return;
+  }
+
+  const originalLengths = textNodes.map((node) => String(node['#text'] ?? '').length);
+  let offset = 0;
+
+  for (let i = 0; i < textNodes.length; i += 1) {
+    const node = textNodes[i];
+    const take = i === textNodes.length - 1
+      ? normalizedText.length - offset
+      : Math.min(originalLengths[i], Math.max(0, normalizedText.length - offset));
+
+    node['#text'] = normalizedText.slice(offset, offset + Math.max(0, take));
+    offset += Math.max(0, take);
+  }
+}
+
+function collectTextLeafNodes(node: OrderedNode, out: OrderedNode[] = []): OrderedNode[] {
+  const name = getNodeName(node);
+  if (name === '#text') {
+    out.push(node);
+    return out;
+  }
+
+  for (const child of getNodeChildren(node)) {
+    collectTextLeafNodes(child, out);
+  }
+
+  return out;
+}
+
+function ensureParagraphTextNode(paragraph: OrderedNode, text: string): void {
+  const paragraphKey = getNodeKey(paragraph);
+  if (!paragraphKey) return;
+
+  const prefix = paragraphKey.includes(':') ? paragraphKey.split(':')[0] : null;
+  const runKey = prefix ? `${prefix}:run` : 'run';
+  const textKey = prefix ? `${prefix}:t` : 't';
+  const paragraphChildren = getMutableChildren(paragraph);
+  const existingRun = paragraphChildren.find((child) => getNodeName(child) === 'run');
+
+  if (existingRun) {
+    const runChildren = getMutableChildren(existingRun);
+    const existingText = runChildren.find((child) => getNodeName(child) === 't');
+
+    if (existingText) {
+      setNodeChildren(existingText, [{ '#text': text }]);
+      return;
+    }
+
+    runChildren.push({ [textKey]: [{ '#text': text }] });
+    return;
+  }
+
+  paragraphChildren.push({
+    [runKey]: [
+      {
+        [textKey]: [{ '#text': text }],
+      },
+    ],
+  });
+}
+
+function normalizePatchedText(text: string): string {
+  return text.replace(/\u00A0/g, ' ').replace(/\r\n?/g, '\n');
 }
 
 async function exportMinimalHwpx(html: string): Promise<Blob> {
@@ -65,8 +242,244 @@ async function exportMinimalHwpx(html: string): Promise<Blob> {
   return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
 }
 
+function extractParagraphGroupsFromHtml(html: string): ExportParagraphGroups {
+  const root = document.createElement('div');
+  root.innerHTML = html;
+
+  const groups: ExportParagraphGroups = {
+    body: [],
+    headers: [],
+    footers: [],
+  };
+
+  for (const child of Array.from(root.childNodes)) {
+    collectParagraphTexts(child, groups.body, groups);
+  }
+
+  return groups;
+}
+
+function collectParagraphTexts(
+  node: ChildNode,
+  target: string[],
+  groups: ExportParagraphGroups
+): void {
+  if (node.nodeType === Node.TEXT_NODE) {
+    const text = normalizeHtmlParagraphText(node.textContent || '');
+    if (text.trim()) target.push(text);
+    return;
+  }
+
+  if (node.nodeType !== Node.ELEMENT_NODE) return;
+  const el = node as HTMLElement;
+  const tag = el.tagName.toLowerCase();
+
+  if (tag === 'section') {
+    const region = el.getAttribute('data-doc-region');
+    if (region === 'header' || region === 'footer') {
+      const nextTarget = region === 'header' ? groups.headers : groups.footers;
+      const regionBody = el.querySelector(':scope > .document-region-body');
+      const children = regionBody ? Array.from(regionBody.childNodes) : Array.from(el.childNodes);
+      for (const child of children) {
+        collectParagraphTexts(child, nextTarget, groups);
+      }
+      return;
+    }
+  }
+
+  if (tag === 'p' || /^h[1-6]$/.test(tag) || tag === 'li') {
+    target.push(extractElementText(el));
+    return;
+  }
+
+  if (tag === 'td' || tag === 'th') {
+    const hasBlockChildren = Array.from(el.children).some((child) =>
+      /^(p|h[1-6]|ul|ol|table|blockquote|div|section)$/i.test(child.tagName)
+    );
+
+    if (!hasBlockChildren) {
+      const text = extractElementText(el);
+      if (text.trim()) target.push(text);
+      return;
+    }
+  }
+
+  if (tag === 'div' && el.classList.contains('document-region-label')) return;
+  if (tag === 'img' || tag === 'hr') return;
+
+  for (const child of Array.from(el.childNodes)) {
+    collectParagraphTexts(child, target, groups);
+  }
+}
+
+function extractElementText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.textContent || '';
+  }
+
+  if (node.nodeType !== Node.ELEMENT_NODE) return '';
+  const el = node as HTMLElement;
+  const tag = el.tagName.toLowerCase();
+
+  if (tag === 'br') return '\n';
+  if (tag === 'img' || tag === 'hr') return '';
+  if (tag === 'div' && el.classList.contains('document-region-label')) return '';
+
+  let text = '';
+  for (const child of Array.from(el.childNodes)) {
+    text += extractElementText(child);
+  }
+
+  return normalizeHtmlParagraphText(text);
+}
+
+function normalizeHtmlParagraphText(text: string): string {
+  return text.replace(/\u00A0/g, ' ');
+}
+
+async function collectManifestXmlRefs(zip: JSZip): Promise<string[]> {
+  const manifest = zip.file('Contents/content.hpf');
+  if (!manifest) return [];
+
+  try {
+    const xml = await manifest.async('string');
+    return parseManifestXmlRefs(xml, 'Contents/content.hpf');
+  } catch {
+    return [];
+  }
+}
+
+function parseManifestXmlRefs(xml: string, manifestPath: string): string[] {
+  const refs: string[] = [];
+  const seen = new Set<string>();
+  const baseDir = manifestPath.split('/').slice(0, -1).join('/');
+
+  for (const match of xml.matchAll(/\b(?:href|full-path|target|src)=["']([^"']+\.xml(?:#[^"']*)?)["']/gi)) {
+    const ref = match[1]?.split('#')[0];
+    if (!ref) continue;
+
+    const resolved = resolveRelativeZipPath(baseDir, ref);
+    if (
+      !resolved ||
+      seen.has(resolved) ||
+      /(?:^|\/)(content\.hpf|mimetype|settings\.xml)$/i.test(resolved) ||
+      !resolved.toLowerCase().startsWith('contents/')
+    ) {
+      continue;
+    }
+
+    seen.add(resolved);
+    refs.push(resolved);
+  }
+
+  return refs;
+}
+
+function collectZipPaths(zip: JSZip, ...patterns: RegExp[]): string[] {
+  const paths: string[] = [];
+
+  zip.forEach((path) => {
+    if (patterns.some((pattern) => pattern.test(path))) {
+      paths.push(path);
+    }
+  });
+
+  return paths.sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+  );
+}
+
+function mergeOrderedPaths(primary: string[], secondary: string[]): string[] {
+  const merged = new Set<string>();
+
+  for (const path of primary) merged.add(path);
+  for (const path of secondary) merged.add(path);
+
+  return Array.from(merged);
+}
+
+function isSectionXmlPath(path: string): boolean {
+  return /(?:^|\/)(sec\d+|section\d+)\.xml$/i.test(path);
+}
+
+function normalizeZipPath(path: string): string {
+  const segments = path.replace(/\\/g, '/').split('/');
+  const normalized: string[] = [];
+
+  for (const segment of segments) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') {
+      normalized.pop();
+      continue;
+    }
+    normalized.push(segment);
+  }
+
+  return normalized.join('/');
+}
+
+function resolveRelativeZipPath(baseDir: string, ref: string): string {
+  if (!ref) return '';
+
+  const normalizedRef = ref.replace(/\\/g, '/');
+  if (/^[A-Za-z]+:\//.test(normalizedRef)) return '';
+  if (normalizedRef.startsWith('/')) return normalizeZipPath(normalizedRef.slice(1));
+  if (!baseDir) return normalizeZipPath(normalizedRef);
+  return normalizeZipPath(`${baseDir}/${normalizedRef}`);
+}
+
+function getNodeName(node: OrderedNode): string | null {
+  const key = getNodeKey(node);
+  if (!key) return null;
+  return key === '#text' ? '#text' : getLocalName(key);
+}
+
+function getNodeKey(node: OrderedNode): string | null {
+  for (const key of Object.keys(node)) {
+    if (key === ':@') continue;
+    return key;
+  }
+  return null;
+}
+
+function getNodeChildren(node: OrderedNode): OrderedNodes {
+  const key = getNodeKey(node);
+  if (!key) return [];
+
+  const value = node[key];
+  return Array.isArray(value) ? (value as OrderedNodes) : [];
+}
+
+function getMutableChildren(node: OrderedNode): OrderedNodes {
+  const key = getNodeKey(node);
+  if (!key) return [];
+
+  const current = node[key];
+  if (Array.isArray(current)) {
+    return current as OrderedNodes;
+  }
+
+  const children: OrderedNodes = [];
+  node[key] = children;
+  return children;
+}
+
+function setNodeChildren(node: OrderedNode, children: OrderedNodes): void {
+  const key = getNodeKey(node);
+  if (!key) return;
+  node[key] = children;
+}
+
+function getLocalName(name: string): string {
+  return name.split(':').pop()?.toLowerCase() || name.toLowerCase();
+}
+
+function isParagraphTag(name: string): boolean {
+  return name === 'p' || name === 'para';
+}
+
 // ──────────────────────────────────────────────
-// HTML → HWPX XML 변환
+// HTML → minimal HWPX XML fallback
 // ──────────────────────────────────────────────
 
 function htmlToHwpxSection(html: string): string {
@@ -124,15 +537,13 @@ function convertNodes(nodes: NodeListOf<ChildNode>, out: string[]): void {
   }
 }
 
-// ── 문단 변환 ──
-
 interface TextRun {
   text: string;
   bold: boolean;
   italic: boolean;
   underline: boolean;
   strike: boolean;
-  fontSize: number; // pt, 0 means default
+  fontSize: number;
 }
 
 function convertParagraph(el: HTMLElement, tag: string): string {
@@ -141,7 +552,6 @@ function convertParagraph(el: HTMLElement, tag: string): string {
     return wrapParagraph([]);
   }
 
-  // 제목 크기 매핑
   const headingSizes: Record<string, number> = {
     h1: 18, h2: 14, h3: 12, h4: 11, h5: 10, h6: 9,
   };
@@ -153,7 +563,6 @@ function convertParagraph(el: HTMLElement, tag: string): string {
     }
   }
 
-  // 정렬
   const align = el.style?.textAlign || '';
   return wrapParagraph(runs, align);
 }
@@ -191,7 +600,6 @@ function collectRuns(
   if (tag === 'u') u = true;
   if (tag === 's' || tag === 'del' || tag === 'strike') s = true;
 
-  // font-size from style
   const style = el.getAttribute('style') || '';
   const fMatch = style.match(/font-size:\s*([\d.]+)pt/);
   if (fMatch) fs = parseFloat(fMatch[1]);
@@ -232,8 +640,6 @@ ${runXml}
   </hp:p>`;
 }
 
-// ── 테이블 변환 ──
-
 function convertTable(table: HTMLElement): string {
   const rows = table.querySelectorAll('tr');
   if (rows.length === 0) return '';
@@ -249,14 +655,12 @@ function convertTable(table: HTMLElement): string {
       const rowspan = parseInt(cell.getAttribute('rowspan') || '1', 10);
 
       const cellParts: string[] = [];
-      // 셀 내 블록 요소 변환
       const blockEls = cell.querySelectorAll('p, h1, h2, h3, h4, h5, h6');
       if (blockEls.length > 0) {
         for (const block of Array.from(blockEls)) {
           cellParts.push(convertParagraph(block as HTMLElement, block.tagName.toLowerCase()));
         }
       } else {
-        // 블록 요소가 없으면 직접 텍스트 추출
         const runs = extractRuns(cell);
         cellParts.push(wrapParagraph(runs.length > 0 ? runs : [{ text: cell.textContent || '', bold: false, italic: false, underline: false, strike: false, fontSize: 0 }]));
       }
@@ -275,8 +679,6 @@ function convertTable(table: HTMLElement): string {
   return `  <hp:tbl>\n${trXml.join('\n')}\n  </hp:tbl>`;
 }
 
-// ── 리스트 변환 ──
-
 function convertList(list: HTMLElement, out: string[]): void {
   const items = list.querySelectorAll(':scope > li');
   for (const li of Array.from(items)) {
@@ -292,8 +694,6 @@ function convertList(list: HTMLElement, out: string[]): void {
     out.push(wrapParagraph(runs));
   }
 }
-
-// ── 유틸 ──
 
 function escapeXml(text: string): string {
   return text

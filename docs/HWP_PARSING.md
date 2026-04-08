@@ -448,21 +448,31 @@ StarterKit 설정: `StarterKit.configure({ paragraph: false })` + 커스텀 `Par
 
 | 원본 포맷 | 내보내기 방식 |
 |-----------|-------------|
-| HWPX | 원본 ZIP 구조 복제 → 섹션 XML만 교체 |
+| HWPX | 원본 ZIP 구조 유지 → 섹션/머리글/바닥글 XML의 문단 텍스트만 순서대로 패치 |
 | HWP | 최소 HWPX 구조 신규 생성 |
 
-### HTML → HWPX XML 변환
+### HWPX 원본 보존형 내보내기
 
-에디터의 HTML을 HWPX XML로 변환. 지원 요소:
+`rawZipData`가 있으면 에디터 HTML을 그대로 새 HWPX로 재생성하지 않는다.
+대신 원본 HWPX 패키지를 다시 열고:
 
-| HTML | HWPX XML |
-|------|----------|
-| `<p>` | `<hp:p><hp:run><hp:t>` |
-| `<h1>`~`<h6>` | `<hp:p>` + `<hp:rPr><hp:bold/><hp:sz/>` |
-| `<strong>` | `<hp:rPr><hp:bold/>` |
-| `<em>` | `<hp:rPr><hp:italic/>` |
-| `<u>` | `<hp:rPr><hp:underline/>` |
-| `<s>` | `<hp:rPr><hp:strikethrough/>` |
-| `text-align` | `<hp:paraPr><hp:align horizontal="..."/>` |
-| `<table>` | `<hp:tbl><hp:tr><hp:tc>` (colspan/rowspan 보존) |
-| `<ul>/<ol>` | `<hp:p>` + 글머리 기호/번호 접두사 |
+1. `content.hpf`에서 본문 섹션 / 머리글 / 바닥글 XML 경로를 수집
+2. 에디터 HTML에서 body / header / footer 영역별 문단 텍스트를 추출
+3. 각 XML 파일을 `fast-xml-parser(preserveOrder)`로 파싱
+4. 원본 XML의 문단(`hp:p`/`para`)을 순서대로 순회하면서 텍스트 노드만 교체
+5. 수정된 XML만 ZIP에 다시 넣어 `.hwpx`로 다운로드
+
+이 방식의 목적은 다음과 같다.
+
+- 원본 표 구조 유지
+- 원본 이미지 / BinData 참조 유지
+- 원본 섹션 수 유지
+- 원본 머리글 / 바닥글 파일 유지
+- 문단 외 레이아웃 정보 손실 최소화
+
+### 현재 한계
+
+- 문단 매핑은 **순서 기반**이라, 에디터에서 문단 수를 크게 바꾸면 새 구조가 완전히 직렬화되지는 않음
+- 기존 HWPX의 비텍스트 객체는 유지되지만, **새 이미지 삽입/새 표 생성**은 아직 완전 미지원
+- 강한 구조 편집보다 **기존 문서 텍스트 수정**에 최적화된 export 경로
+- `.hwp` 원본은 보존형 패치 대상이 아니므로 여전히 최소 HWPX fallback 사용
