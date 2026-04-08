@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import { XMLBuilder, XMLParser } from 'fast-xml-parser';
+import type { HwpxExportContext, HwpxExportPlanEntry } from '../../types';
 
 type OrderedNode = Record<string, unknown>;
 type OrderedNodes = OrderedNode[];
@@ -43,20 +44,59 @@ const orderedXmlBuilder = new XMLBuilder({
  */
 export async function exportToHwpx(
   html: string,
-  originalZipData?: ArrayBuffer
+  originalZipData?: ArrayBuffer,
+  exportContext?: HwpxExportContext
 ): Promise<Blob> {
   if (originalZipData) {
-    return exportWithOriginalStructure(html, originalZipData);
+    return exportWithOriginalStructure(html, originalZipData, exportContext);
   }
   return exportMinimalHwpx(html);
 }
 
 async function exportWithOriginalStructure(
   html: string,
-  originalZipData: ArrayBuffer
+  originalZipData: ArrayBuffer,
+  exportContext?: HwpxExportContext
 ): Promise<Blob> {
   const zip = await JSZip.loadAsync(originalZipData);
   const groups = extractParagraphGroupsFromHtml(html);
+  const exportEntries = await resolveExportEntries(zip, exportContext);
+
+  const headerCursor: ParagraphCursor = { index: 0, values: groups.headers };
+  const bodyCursor: ParagraphCursor = { index: 0, values: groups.body };
+  const footerCursor: ParagraphCursor = { index: 0, values: groups.footers };
+
+  for (const entry of exportEntries.filter((item) => item.region === 'header')) {
+    await patchXmlFileText(zip, entry.path, headerCursor);
+  }
+
+  const bodyEntries = exportEntries.filter((item) => item.region === 'body');
+  if (bodyEntries.length === 0) {
+    zip.file('Contents/sec0.xml', htmlToHwpxSection(html));
+  } else {
+    for (const entry of bodyEntries) {
+      await patchXmlFileText(zip, entry.path, bodyCursor);
+    }
+  }
+
+  for (const entry of exportEntries.filter((item) => item.region === 'footer')) {
+    await patchXmlFileText(zip, entry.path, footerCursor);
+  }
+
+  return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+}
+
+async function resolveExportEntries(
+  zip: JSZip,
+  exportContext?: HwpxExportContext
+): Promise<HwpxExportPlanEntry[]> {
+  const contextEntries = exportContext?.entries
+    ?.filter((entry) => Boolean(entry?.path) && Boolean(zip.file(entry.path)));
+
+  if (contextEntries && contextEntries.length > 0) {
+    return contextEntries;
+  }
+
   const manifestXmlRefs = await collectManifestXmlRefs(zip);
   const sectionPaths = mergeOrderedPaths(
     manifestXmlRefs.filter(isSectionXmlPath),
@@ -71,27 +111,11 @@ async function exportWithOriginalStructure(
     collectZipPaths(zip, /Contents\/[^/]*footer[^/]*\.xml$/i)
   );
 
-  const headerCursor: ParagraphCursor = { index: 0, values: groups.headers };
-  const bodyCursor: ParagraphCursor = { index: 0, values: groups.body };
-  const footerCursor: ParagraphCursor = { index: 0, values: groups.footers };
-
-  for (const path of headerPaths) {
-    await patchXmlFileText(zip, path, headerCursor);
-  }
-
-  if (sectionPaths.length === 0) {
-    zip.file('Contents/sec0.xml', htmlToHwpxSection(html));
-  } else {
-    for (const path of sectionPaths) {
-      await patchXmlFileText(zip, path, bodyCursor);
-    }
-  }
-
-  for (const path of footerPaths) {
-    await patchXmlFileText(zip, path, footerCursor);
-  }
-
-  return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+  return [
+    ...headerPaths.map((path): HwpxExportPlanEntry => ({ path, region: 'header', paragraphCount: 0 })),
+    ...sectionPaths.map((path): HwpxExportPlanEntry => ({ path, region: 'body', paragraphCount: 0 })),
+    ...footerPaths.map((path): HwpxExportPlanEntry => ({ path, region: 'footer', paragraphCount: 0 })),
+  ];
 }
 
 async function patchXmlFileText(

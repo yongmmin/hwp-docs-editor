@@ -9,6 +9,16 @@ export interface PageLayout {
   footerPaddingPt?: number;
 }
 
+export interface HwpxExportPlanEntry {
+  path: string;
+  region: 'body' | 'header' | 'footer';
+  paragraphCount: number;
+}
+
+export interface HwpxExportContext {
+  entries: HwpxExportPlanEntry[];
+}
+
 export interface ParsedDocument {
   title: string;
   html: string;
@@ -20,6 +30,8 @@ export interface ParsedDocument {
   originalFormat: 'hwp' | 'hwpx';
   /** Raw HWPX zip data for re-export (preserves structure) */
   rawZipData?: ArrayBuffer;
+  /** Parser-derived path/order metadata for structure-preserving HWPX export */
+  hwpxExportContext?: HwpxExportContext;
 }
 
 export interface DocumentMetadata {

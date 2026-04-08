@@ -59,7 +59,7 @@ export function AppShell() {
     if (!editorEl) return;
 
     const html = editorEl.innerHTML;
-    const blob = await exportToHwpx(html, doc?.rawZipData);
+    const blob = await exportToHwpx(html, doc?.rawZipData, doc?.hwpxExportContext);
     downloadBlob(blob, getExportFilename(fileName));
   }, [doc, fileName]);
 

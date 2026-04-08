@@ -1,6 +1,11 @@
 import JSZip from 'jszip';
 import { XMLParser } from 'fast-xml-parser';
-import type { DocumentMetadata, ParsedDocument } from '../../types';
+import type {
+  DocumentMetadata,
+  HwpxExportContext,
+  HwpxExportPlanEntry,
+  ParsedDocument,
+} from '../../types';
 
 const metadataParser = new XMLParser({
   ignoreAttributes: false,
@@ -30,6 +35,16 @@ interface HwpxParseContext {
   imageSources: Map<string, string>;
 }
 
+interface ParsedXmlContent {
+  html: string;
+  paragraphCount: number;
+}
+
+interface ExtractedContent {
+  html: string;
+  exportContext: HwpxExportContext;
+}
+
 const EMPTY_STYLE: InlineStyle = {
   bold: false,
   italic: false,
@@ -46,7 +61,7 @@ export async function parseHwpx(buffer: ArrayBuffer): Promise<ParsedDocument> {
     extractMetadata(zip),
     buildImageSourceMap(zip),
   ]);
-  const html = await extractContent(zip, { imageSources });
+  const { html, exportContext } = await extractContent(zip, { imageSources });
 
   return {
     title: metadata.title || '제목 없음',
@@ -54,6 +69,7 @@ export async function parseHwpx(buffer: ArrayBuffer): Promise<ParsedDocument> {
     metadata,
     originalFormat: 'hwpx',
     rawZipData: buffer,
+    hwpxExportContext: exportContext,
   };
 }
 
@@ -75,7 +91,7 @@ async function extractMetadata(zip: JSZip): Promise<DocumentMetadata> {
   }
 }
 
-async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<string> {
+async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<ExtractedContent> {
   const manifestXmlRefs = await collectManifestXmlRefs(zip);
   const sectionPaths = mergeOrderedPaths(
     manifestXmlRefs.filter(isSectionXmlPath),
@@ -102,42 +118,64 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<string
   );
 
   const htmlParts: string[] = [];
+  const exportEntries: HwpxExportPlanEntry[] = [];
 
   for (let i = 0; i < headerPaths.length; i++) {
-    const html = await parseRegionFile(zip, headerPaths[i], 'header', i + 1, ctx);
-    if (html) htmlParts.push(html);
+    const result = await parseRegionFile(zip, headerPaths[i], 'header', i + 1, ctx);
+    if (result.html) htmlParts.push(result.html);
+    exportEntries.push({
+      path: headerPaths[i],
+      region: 'header',
+      paragraphCount: result.paragraphCount,
+    });
   }
 
   if (sectionPaths.length > 0) {
     for (const path of sectionPaths) {
-      const html = await parseXmlFile(zip, path, ctx);
-      if (html) htmlParts.push(html);
+      const result = await parseXmlFile(zip, path, ctx);
+      if (result.html) htmlParts.push(result.html);
+      exportEntries.push({ path, region: 'body', paragraphCount: result.paragraphCount });
     }
   } else if (fallbackSectionPaths.length > 0) {
     for (const path of fallbackSectionPaths) {
-      const html = await parseXmlFile(zip, path, ctx);
-      if (html) htmlParts.push(html);
+      const result = await parseXmlFile(zip, path, ctx);
+      if (result.html) htmlParts.push(result.html);
+      exportEntries.push({ path, region: 'body', paragraphCount: result.paragraphCount });
     }
   } else if (fallbackContentXmls.length > 0) {
     for (const path of fallbackContentXmls) {
-      const html = await parseXmlFile(zip, path, ctx);
-      if (html) htmlParts.push(html);
+      const result = await parseXmlFile(zip, path, ctx);
+      if (result.html) htmlParts.push(result.html);
+      exportEntries.push({ path, region: 'body', paragraphCount: result.paragraphCount });
     }
   } else {
     const contentXml = zip.file('Contents/content.xml');
     if (contentXml) {
       const xml = await contentXml.async('string');
       const fallback = parseXmlContent(xml, ctx);
-      if (fallback) htmlParts.push(fallback);
+      if (fallback.html) htmlParts.push(fallback.html);
+      exportEntries.push({
+        path: 'Contents/content.xml',
+        region: 'body',
+        paragraphCount: fallback.paragraphCount,
+      });
     }
   }
 
   for (let i = 0; i < footerPaths.length; i++) {
-    const html = await parseRegionFile(zip, footerPaths[i], 'footer', i + 1, ctx);
-    if (html) htmlParts.push(html);
+    const result = await parseRegionFile(zip, footerPaths[i], 'footer', i + 1, ctx);
+    if (result.html) htmlParts.push(result.html);
+    exportEntries.push({
+      path: footerPaths[i],
+      region: 'footer',
+      paragraphCount: result.paragraphCount,
+    });
   }
 
-  return htmlParts.join('');
+  return {
+    html: htmlParts.join(''),
+    exportContext: { entries: exportEntries },
+  };
 }
 
 async function collectManifestXmlRefs(zip: JSZip): Promise<string[]> {
@@ -179,9 +217,9 @@ async function parseXmlFile(
   zip: JSZip,
   path: string,
   ctx: HwpxParseContext
-): Promise<string> {
+) : Promise<ParsedXmlContent> {
   const file = zip.file(path);
-  if (!file) return '';
+  if (!file) return { html: '', paragraphCount: 0 };
 
   const xml = await file.async('string');
   return parseXmlContent(xml, ctx);
@@ -193,25 +231,42 @@ async function parseRegionFile(
   kind: 'header' | 'footer',
   index: number,
   ctx: HwpxParseContext
-): Promise<string> {
+): Promise<ParsedXmlContent> {
   const file = zip.file(path);
-  if (!file) return '';
+  if (!file) return { html: '', paragraphCount: 0 };
 
   const xml = await file.async('string');
   const content = parseXmlContent(xml, ctx);
-  if (!content) return '';
+  if (!content.html) return content;
 
   const title = `${kind === 'header' ? '머리글' : '바닥글'} ${index}`;
-  return wrapRegion(kind, title, content);
+  return {
+    html: wrapRegion(kind, title, content.html),
+    paragraphCount: content.paragraphCount,
+  };
 }
 
-function parseXmlContent(xml: string, ctx: HwpxParseContext): string {
+function parseXmlContent(xml: string, ctx: HwpxParseContext): ParsedXmlContent {
   try {
     const parsed = orderedXmlParser.parse(xml) as OrderedNodes;
     const html = renderBlocks(parsed, ctx).join('');
-    return html || extractTextFromXml(xml);
+    const paragraphCount = countParagraphNodes(parsed);
+
+    if (html) {
+      return { html, paragraphCount };
+    }
+
+    const fallbackHtml = extractTextFromXml(xml);
+    return {
+      html: fallbackHtml,
+      paragraphCount: fallbackHtml ? 1 : paragraphCount,
+    };
   } catch {
-    return extractTextFromXml(xml);
+    const fallbackHtml = extractTextFromXml(xml);
+    return {
+      html: fallbackHtml,
+      paragraphCount: fallbackHtml ? 1 : 0,
+    };
   }
 }
 
@@ -711,6 +766,23 @@ function applyInlineStyle(text: string, style: InlineStyle): string {
 
 function isParagraphTag(name: string): boolean {
   return name === 'p' || name === 'para';
+}
+
+function countParagraphNodes(nodes: OrderedNodes): number {
+  let count = 0;
+
+  for (const node of nodes) {
+    const name = getNodeName(node);
+    if (!name) continue;
+
+    if (isParagraphTag(name)) {
+      count += 1;
+    }
+
+    count += countParagraphNodes(getNodeChildren(node));
+  }
+
+  return count;
 }
 
 function isSectionXmlPath(path: string): boolean {
