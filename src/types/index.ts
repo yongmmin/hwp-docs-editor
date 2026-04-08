@@ -14,6 +14,7 @@ export interface HwpxExportPlanEntry {
   region: 'body' | 'header' | 'footer';
   paragraphCount: number;
   textSignature?: string;
+  paragraphIds?: string[];
 }
 
 export interface HwpxExportContext {

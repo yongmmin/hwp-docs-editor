@@ -1,6 +1,6 @@
 import JSZip from 'jszip';
 import { XMLParser } from 'fast-xml-parser';
-import { computeParagraphSignature, extractParagraphGroupsFromHtml } from './exportPlan';
+import { computeParagraphSignature } from './exportPlan';
 import type {
   DocumentMetadata,
   HwpxExportContext,
@@ -36,10 +36,18 @@ interface HwpxParseContext {
   imageSources: Map<string, string>;
 }
 
+interface ParagraphRenderState {
+  path: string;
+  paragraphIds: string[];
+  paragraphTexts: string[];
+  nextParagraphIndex: number;
+}
+
 interface ParsedXmlContent {
   html: string;
   paragraphCount: number;
   textSignature: string;
+  paragraphIds: string[];
 }
 
 interface ExtractedContent {
@@ -130,6 +138,7 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
       region: 'header',
       paragraphCount: result.paragraphCount,
       textSignature: result.textSignature,
+      paragraphIds: result.paragraphIds,
     });
   }
 
@@ -142,6 +151,7 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
         region: 'body',
         paragraphCount: result.paragraphCount,
         textSignature: result.textSignature,
+        paragraphIds: result.paragraphIds,
       });
     }
   } else if (fallbackSectionPaths.length > 0) {
@@ -153,6 +163,7 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
         region: 'body',
         paragraphCount: result.paragraphCount,
         textSignature: result.textSignature,
+        paragraphIds: result.paragraphIds,
       });
     }
   } else if (fallbackContentXmls.length > 0) {
@@ -164,19 +175,21 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
         region: 'body',
         paragraphCount: result.paragraphCount,
         textSignature: result.textSignature,
+        paragraphIds: result.paragraphIds,
       });
     }
   } else {
     const contentXml = zip.file('Contents/content.xml');
     if (contentXml) {
       const xml = await contentXml.async('string');
-      const fallback = parseXmlContent(xml, ctx);
+      const fallback = parseXmlContent(xml, ctx, 'Contents/content.xml');
       if (fallback.html) htmlParts.push(fallback.html);
       exportEntries.push({
         path: 'Contents/content.xml',
         region: 'body',
         paragraphCount: fallback.paragraphCount,
         textSignature: fallback.textSignature,
+        paragraphIds: fallback.paragraphIds,
       });
     }
   }
@@ -189,6 +202,7 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
       region: 'footer',
       paragraphCount: result.paragraphCount,
       textSignature: result.textSignature,
+      paragraphIds: result.paragraphIds,
     });
   }
 
@@ -239,10 +253,17 @@ async function parseXmlFile(
   ctx: HwpxParseContext
 ) : Promise<ParsedXmlContent> {
   const file = zip.file(path);
-  if (!file) return { html: '', paragraphCount: 0, textSignature: computeParagraphSignature([]) };
+  if (!file) {
+    return {
+      html: '',
+      paragraphCount: 0,
+      textSignature: computeParagraphSignature([]),
+      paragraphIds: [],
+    };
+  }
 
   const xml = await file.async('string');
-  return parseXmlContent(xml, ctx);
+  return parseXmlContent(xml, ctx, path);
 }
 
 async function parseRegionFile(
@@ -253,10 +274,17 @@ async function parseRegionFile(
   ctx: HwpxParseContext
 ): Promise<ParsedXmlContent> {
   const file = zip.file(path);
-  if (!file) return { html: '', paragraphCount: 0, textSignature: computeParagraphSignature([]) };
+  if (!file) {
+    return {
+      html: '',
+      paragraphCount: 0,
+      textSignature: computeParagraphSignature([]),
+      paragraphIds: [],
+    };
+  }
 
   const xml = await file.async('string');
-  const content = parseXmlContent(xml, ctx);
+  const content = parseXmlContent(xml, ctx, path);
   if (!content.html) return content;
 
   const title = `${kind === 'header' ? '머리글' : '바닥글'} ${index}`;
@@ -264,20 +292,28 @@ async function parseRegionFile(
     html: wrapRegion(kind, title, content.html),
     paragraphCount: content.paragraphCount,
     textSignature: content.textSignature,
+    paragraphIds: content.paragraphIds,
   };
 }
 
-function parseXmlContent(xml: string, ctx: HwpxParseContext): ParsedXmlContent {
+function parseXmlContent(xml: string, ctx: HwpxParseContext, path: string): ParsedXmlContent {
   try {
     const parsed = orderedXmlParser.parse(xml) as OrderedNodes;
-    const html = renderBlocks(parsed, ctx).join('');
-    const paragraphCount = countParagraphNodes(parsed);
+    const renderState: ParagraphRenderState = {
+      path,
+      paragraphIds: [],
+      paragraphTexts: [],
+      nextParagraphIndex: 0,
+    };
+    const html = renderBlocks(parsed, ctx, renderState).join('');
+    const paragraphCount = renderState.paragraphIds.length;
 
     if (html) {
       return {
         html,
         paragraphCount,
-        textSignature: computeParagraphSignature(extractParagraphGroupsFromHtml(html).body),
+        textSignature: computeParagraphSignature(renderState.paragraphTexts),
+        paragraphIds: renderState.paragraphIds,
       };
     }
 
@@ -285,14 +321,16 @@ function parseXmlContent(xml: string, ctx: HwpxParseContext): ParsedXmlContent {
     return {
       html: fallbackHtml,
       paragraphCount: fallbackHtml ? 1 : paragraphCount,
-      textSignature: computeParagraphSignature(extractParagraphGroupsFromHtml(fallbackHtml).body),
+      textSignature: computeParagraphSignature(fallbackHtml ? [stripHtml(fallbackHtml).trim()] : []),
+      paragraphIds: renderState.paragraphIds,
     };
   } catch {
     const fallbackHtml = extractTextFromXml(xml);
     return {
       html: fallbackHtml,
       paragraphCount: fallbackHtml ? 1 : 0,
-      textSignature: computeParagraphSignature(extractParagraphGroupsFromHtml(fallbackHtml).body),
+      textSignature: computeParagraphSignature(fallbackHtml ? [stripHtml(fallbackHtml).trim()] : []),
+      paragraphIds: [],
     };
   }
 }
@@ -415,7 +453,11 @@ function parseManifestXmlRefs(xml: string, manifestPath: string): string[] {
   return refs;
 }
 
-function renderBlocks(nodes: OrderedNodes, ctx: HwpxParseContext): string[] {
+function renderBlocks(
+  nodes: OrderedNodes,
+  ctx: HwpxParseContext,
+  renderState: ParagraphRenderState
+): string[] {
   const html: string[] = [];
 
   for (const node of nodes) {
@@ -429,18 +471,18 @@ function renderBlocks(nodes: OrderedNodes, ctx: HwpxParseContext): string[] {
     }
 
     if (isParagraphTag(name)) {
-      html.push(...renderParagraph(node, ctx));
+      html.push(...renderParagraph(node, ctx, renderState));
       continue;
     }
 
     if (isTableTag(name)) {
-      const table = renderTable(node, ctx);
+      const table = renderTable(node, ctx, renderState);
       if (table) html.push(table);
       continue;
     }
 
     if (name === 'header' || name === 'footer') {
-      const content = renderBlocks(getNodeChildren(node), ctx).join('');
+      const content = renderBlocks(getNodeChildren(node), ctx, renderState).join('');
       if (content) {
         html.push(wrapRegion(name, name === 'header' ? '머리글' : '바닥글', content));
       }
@@ -452,13 +494,17 @@ function renderBlocks(nodes: OrderedNodes, ctx: HwpxParseContext): string[] {
       continue;
     }
 
-    html.push(...renderBlocks(getNodeChildren(node), ctx));
+    html.push(...renderBlocks(getNodeChildren(node), ctx, renderState));
   }
 
   return html;
 }
 
-function renderParagraph(node: OrderedNode, ctx: HwpxParseContext): string[] {
+function renderParagraph(
+  node: OrderedNode,
+  ctx: HwpxParseContext,
+  renderState: ParagraphRenderState
+): string[] {
   const paragraphContent = renderInlineNodes(getNodeChildren(node), ctx, EMPTY_STYLE);
   const images = collectEmbeddedImages(getNodeChildren(node), ctx);
   const html: string[] = [];
@@ -467,7 +513,11 @@ function renderParagraph(node: OrderedNode, ctx: HwpxParseContext): string[] {
   const style = align && align !== 'left' ? ` style="text-align:${align}"` : '';
 
   if (plainText) {
-    html.push(`<p${style}>${paragraphContent}</p>`);
+    const paraId = buildParagraphId(renderState.path, renderState.nextParagraphIndex);
+    renderState.nextParagraphIndex += 1;
+    renderState.paragraphIds.push(paraId);
+    renderState.paragraphTexts.push(plainText);
+    html.push(`<p data-hwp-para-id="${escapeHtml(paraId)}"${style}>${paragraphContent}</p>`);
   }
 
   html.push(...images);
@@ -521,12 +571,12 @@ function renderInlineNodes(
   return parts.join('');
 }
 
-function renderTable(node: OrderedNode, ctx: HwpxParseContext): string {
+function renderTable(node: OrderedNode, ctx: HwpxParseContext, renderState: ParagraphRenderState): string {
   const rows = collectDirectDescendants(node, (name) => name === 'tr', true);
   if (rows.length === 0) return '';
 
   const body = rows
-    .map((row) => renderTableRow(row, ctx))
+    .map((row) => renderTableRow(row, ctx, renderState))
     .filter(Boolean)
     .join('');
 
@@ -534,7 +584,7 @@ function renderTable(node: OrderedNode, ctx: HwpxParseContext): string {
   return `<table style="width:100%;table-layout:fixed"><tbody>${body}</tbody></table>`;
 }
 
-function renderTableRow(row: OrderedNode, ctx: HwpxParseContext): string {
+function renderTableRow(row: OrderedNode, ctx: HwpxParseContext, renderState: ParagraphRenderState): string {
   const cells = collectDirectDescendants(
     row,
     (name) => name === 'tc' || name === 'td' || name === 'th',
@@ -542,21 +592,25 @@ function renderTableRow(row: OrderedNode, ctx: HwpxParseContext): string {
   );
 
   const html = cells
-    .map((cell) => renderTableCell(cell, ctx))
+    .map((cell) => renderTableCell(cell, ctx, renderState))
     .filter(Boolean)
     .join('');
 
   return html ? `<tr>${html}</tr>` : '';
 }
 
-function renderTableCell(cell: OrderedNode, ctx: HwpxParseContext): string {
+function renderTableCell(
+  cell: OrderedNode,
+  ctx: HwpxParseContext,
+  renderState: ParagraphRenderState
+): string {
   const name = getNodeName(cell);
   if (!name) return '';
 
   const attrs = getNodeAttributes(cell);
   const colspan = getNumericAttribute(attrs, 'colspan', 'colSpan');
   const rowspan = getNumericAttribute(attrs, 'rowspan', 'rowSpan');
-  const content = renderBlocks(getNodeChildren(cell), ctx).join('') || '<p>&nbsp;</p>';
+  const content = renderBlocks(getNodeChildren(cell), ctx, renderState).join('') || '<p>&nbsp;</p>';
   const tag = name === 'th' ? 'th' : 'td';
 
   const htmlAttrs = [
@@ -795,21 +849,13 @@ function isParagraphTag(name: string): boolean {
   return name === 'p' || name === 'para';
 }
 
-function countParagraphNodes(nodes: OrderedNodes): number {
-  let count = 0;
+function buildParagraphId(path: string, index: number): string {
+  const base = path
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toLowerCase();
 
-  for (const node of nodes) {
-    const name = getNodeName(node);
-    if (!name) continue;
-
-    if (isParagraphTag(name)) {
-      count += 1;
-    }
-
-    count += countParagraphNodes(getNodeChildren(node));
-  }
-
-  return count;
+  return `${base || 'paragraph'}_p${index}`;
 }
 
 function isSectionXmlPath(path: string): boolean {

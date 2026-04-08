@@ -12,6 +12,14 @@ export const Paragraph = BaseParagraph.extend({
   addAttributes() {
     return {
       ...this.parent?.(),
+      'data-hwp-para-id': {
+        default: null,
+        parseHTML: (element) => element.getAttribute('data-hwp-para-id') || null,
+        renderHTML: (attributes) => {
+          const value = attributes['data-hwp-para-id'];
+          return value ? { 'data-hwp-para-id': value } : {};
+        },
+      },
       style: {
         default: null,
         parseHTML: (element) => element.getAttribute('style') || null,

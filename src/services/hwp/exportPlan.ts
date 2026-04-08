@@ -4,6 +4,22 @@ export interface ExportParagraphGroups {
   footers: string[];
 }
 
+export function extractParagraphTextById(html: string): Map<string, string> {
+  const root = document.createElement('div');
+  root.innerHTML = html;
+
+  const values = new Map<string, string>();
+  const elements = root.querySelectorAll<HTMLElement>('[data-hwp-para-id]');
+
+  for (const element of Array.from(elements)) {
+    const id = element.getAttribute('data-hwp-para-id');
+    if (!id) continue;
+    values.set(id, extractElementText(element));
+  }
+
+  return values;
+}
+
 export function extractParagraphGroupsFromHtml(html: string): ExportParagraphGroups {
   const root = document.createElement('div');
   root.innerHTML = html;

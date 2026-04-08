@@ -1,6 +1,6 @@
 import JSZip from 'jszip';
 import { XMLBuilder, XMLParser } from 'fast-xml-parser';
-import { computeParagraphSignature, extractParagraphGroupsFromHtml } from './exportPlan';
+import { computeParagraphSignature, extractParagraphGroupsFromHtml, extractParagraphTextById } from './exportPlan';
 import type { HwpxExportContext, HwpxExportPlanEntry } from '../../types';
 
 type OrderedNode = Record<string, unknown>;
@@ -55,17 +55,18 @@ async function exportWithOriginalStructure(
 ): Promise<Blob> {
   const zip = await JSZip.loadAsync(originalZipData);
   const groups = extractParagraphGroupsFromHtml(html);
+  const paragraphTextById = extractParagraphTextById(html);
   const exportEntries = getContextExportEntries(zip, exportContext);
 
   if (exportEntries.length > 0) {
-    await patchRegionEntries(zip, exportEntries, 'header', groups.headers);
+    await patchRegionEntries(zip, exportEntries, 'header', groups.headers, paragraphTextById);
     const bodyEntries = exportEntries.filter((item) => item.region === 'body');
     if (bodyEntries.length === 0) {
       zip.file('Contents/sec0.xml', htmlToHwpxSection(html));
     } else {
-      await patchRegionEntries(zip, exportEntries, 'body', groups.body);
+      await patchRegionEntries(zip, exportEntries, 'body', groups.body, paragraphTextById);
     }
-    await patchRegionEntries(zip, exportEntries, 'footer', groups.footers);
+    await patchRegionEntries(zip, exportEntries, 'footer', groups.footers, paragraphTextById);
     return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
   }
 
@@ -87,7 +88,7 @@ async function exportWithOriginalStructure(
     }
   }
 
-  for (const entry of exportEntries.filter((item) => item.region === 'footer')) {
+  for (const entry of fallbackEntries.filter((item) => item.region === 'footer')) {
     await patchXmlFileText(zip, entry.path, footerCursor);
   }
 
@@ -107,12 +108,13 @@ async function patchRegionEntries(
   exportEntries: HwpxExportPlanEntry[],
   region: 'body' | 'header' | 'footer',
   values: string[],
+  paragraphTextById: Map<string, string>,
 ): Promise<void> {
   const entries = exportEntries.filter((item) => item.region === region);
   let index = 0;
 
   for (const entry of entries) {
-    const nextValues = values.slice(index, index + Math.max(0, entry.paragraphCount));
+    const nextValues = getEntryValues(entry, values, paragraphTextById, index);
     index += Math.max(0, entry.paragraphCount);
 
     if (entry.textSignature && computeParagraphSignature(nextValues) === entry.textSignature) {
@@ -121,6 +123,19 @@ async function patchRegionEntries(
 
     await patchXmlFileValues(zip, entry.path, nextValues);
   }
+}
+
+function getEntryValues(
+  entry: HwpxExportPlanEntry,
+  regionValues: string[],
+  paragraphTextById: Map<string, string>,
+  offset: number
+): string[] {
+  if (entry.paragraphIds && entry.paragraphIds.length > 0) {
+    return entry.paragraphIds.map((id) => paragraphTextById.get(id) ?? '');
+  }
+
+  return regionValues.slice(offset, offset + Math.max(0, entry.paragraphCount));
 }
 
 async function resolveFallbackExportEntries(
