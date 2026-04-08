@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import { XMLBuilder, XMLParser } from 'fast-xml-parser';
+import { computeParagraphSignature, extractParagraphGroupsFromHtml } from './exportPlan';
 import type { HwpxExportContext, HwpxExportPlanEntry } from '../../types';
 
 type OrderedNode = Record<string, unknown>;
@@ -8,12 +9,6 @@ type OrderedNodes = OrderedNode[];
 interface ParagraphCursor {
   index: number;
   values: string[];
-}
-
-interface ExportParagraphGroups {
-  body: string[];
-  headers: string[];
-  footers: string[];
 }
 
 const orderedXmlParser = new XMLParser({
@@ -60,17 +55,30 @@ async function exportWithOriginalStructure(
 ): Promise<Blob> {
   const zip = await JSZip.loadAsync(originalZipData);
   const groups = extractParagraphGroupsFromHtml(html);
-  const exportEntries = await resolveExportEntries(zip, exportContext);
+  const exportEntries = getContextExportEntries(zip, exportContext);
 
+  if (exportEntries.length > 0) {
+    await patchRegionEntries(zip, exportEntries, 'header', groups.headers);
+    const bodyEntries = exportEntries.filter((item) => item.region === 'body');
+    if (bodyEntries.length === 0) {
+      zip.file('Contents/sec0.xml', htmlToHwpxSection(html));
+    } else {
+      await patchRegionEntries(zip, exportEntries, 'body', groups.body);
+    }
+    await patchRegionEntries(zip, exportEntries, 'footer', groups.footers);
+    return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+  }
+
+  const fallbackEntries = await resolveFallbackExportEntries(zip);
   const headerCursor: ParagraphCursor = { index: 0, values: groups.headers };
   const bodyCursor: ParagraphCursor = { index: 0, values: groups.body };
   const footerCursor: ParagraphCursor = { index: 0, values: groups.footers };
 
-  for (const entry of exportEntries.filter((item) => item.region === 'header')) {
+  for (const entry of fallbackEntries.filter((item) => item.region === 'header')) {
     await patchXmlFileText(zip, entry.path, headerCursor);
   }
 
-  const bodyEntries = exportEntries.filter((item) => item.region === 'body');
+  const bodyEntries = fallbackEntries.filter((item) => item.region === 'body');
   if (bodyEntries.length === 0) {
     zip.file('Contents/sec0.xml', htmlToHwpxSection(html));
   } else {
@@ -86,17 +94,38 @@ async function exportWithOriginalStructure(
   return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
 }
 
-async function resolveExportEntries(
+function getContextExportEntries(
   zip: JSZip,
   exportContext?: HwpxExportContext
-): Promise<HwpxExportPlanEntry[]> {
-  const contextEntries = exportContext?.entries
-    ?.filter((entry) => Boolean(entry?.path) && Boolean(zip.file(entry.path)));
+): HwpxExportPlanEntry[] {
+  return exportContext?.entries
+    ?.filter((entry) => Boolean(entry?.path) && Boolean(zip.file(entry.path))) ?? [];
+}
 
-  if (contextEntries && contextEntries.length > 0) {
-    return contextEntries;
+async function patchRegionEntries(
+  zip: JSZip,
+  exportEntries: HwpxExportPlanEntry[],
+  region: 'body' | 'header' | 'footer',
+  values: string[],
+): Promise<void> {
+  const entries = exportEntries.filter((item) => item.region === region);
+  let index = 0;
+
+  for (const entry of entries) {
+    const nextValues = values.slice(index, index + Math.max(0, entry.paragraphCount));
+    index += Math.max(0, entry.paragraphCount);
+
+    if (entry.textSignature && computeParagraphSignature(nextValues) === entry.textSignature) {
+      continue;
+    }
+
+    await patchXmlFileValues(zip, entry.path, nextValues);
   }
+}
 
+async function resolveFallbackExportEntries(
+  zip: JSZip,
+): Promise<HwpxExportPlanEntry[]> {
   const manifestXmlRefs = await collectManifestXmlRefs(zip);
   const sectionPaths = mergeOrderedPaths(
     manifestXmlRefs.filter(isSectionXmlPath),
@@ -118,6 +147,21 @@ async function resolveExportEntries(
   ];
 }
 
+async function patchXmlFileValues(
+  zip: JSZip,
+  path: string,
+  values: string[],
+): Promise<void> {
+  const file = zip.file(path);
+  if (!file) return;
+
+  const xml = await file.async('string');
+  const nextXml = patchXmlParagraphValues(xml, values);
+  if (nextXml !== xml) {
+    zip.file(path, nextXml);
+  }
+}
+
 async function patchXmlFileText(
   zip: JSZip,
   path: string,
@@ -132,6 +176,22 @@ async function patchXmlFileText(
   const nextXml = patchXmlParagraphText(xml, cursor);
   if (nextXml !== xml) {
     zip.file(path, nextXml);
+  }
+}
+
+function patchXmlParagraphValues(xml: string, values: string[]): string {
+  try {
+    const declaration = xml.match(/^\s*<\?xml[^>]*\?>\s*/)?.[0] ?? '';
+    const parsed = orderedXmlParser.parse(xml) as OrderedNodes;
+    const paragraphs = collectParagraphNodes(parsed);
+
+    for (let i = 0; i < paragraphs.length; i += 1) {
+      patchParagraphNodeText(paragraphs[i], values[i] ?? '');
+    }
+
+    return `${declaration}${orderedXmlBuilder.build(parsed)}`;
+  } catch {
+    return xml;
   }
 }
 
@@ -264,101 +324,6 @@ async function exportMinimalHwpx(html: string): Promise<Blob> {
   zip.file('Contents/sec0.xml', htmlToHwpxSection(html));
 
   return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
-}
-
-function extractParagraphGroupsFromHtml(html: string): ExportParagraphGroups {
-  const root = document.createElement('div');
-  root.innerHTML = html;
-
-  const groups: ExportParagraphGroups = {
-    body: [],
-    headers: [],
-    footers: [],
-  };
-
-  for (const child of Array.from(root.childNodes)) {
-    collectParagraphTexts(child, groups.body, groups);
-  }
-
-  return groups;
-}
-
-function collectParagraphTexts(
-  node: ChildNode,
-  target: string[],
-  groups: ExportParagraphGroups
-): void {
-  if (node.nodeType === Node.TEXT_NODE) {
-    const text = normalizeHtmlParagraphText(node.textContent || '');
-    if (text.trim()) target.push(text);
-    return;
-  }
-
-  if (node.nodeType !== Node.ELEMENT_NODE) return;
-  const el = node as HTMLElement;
-  const tag = el.tagName.toLowerCase();
-
-  if (tag === 'section') {
-    const region = el.getAttribute('data-doc-region');
-    if (region === 'header' || region === 'footer') {
-      const nextTarget = region === 'header' ? groups.headers : groups.footers;
-      const regionBody = el.querySelector(':scope > .document-region-body');
-      const children = regionBody ? Array.from(regionBody.childNodes) : Array.from(el.childNodes);
-      for (const child of children) {
-        collectParagraphTexts(child, nextTarget, groups);
-      }
-      return;
-    }
-  }
-
-  if (tag === 'p' || /^h[1-6]$/.test(tag) || tag === 'li') {
-    target.push(extractElementText(el));
-    return;
-  }
-
-  if (tag === 'td' || tag === 'th') {
-    const hasBlockChildren = Array.from(el.children).some((child) =>
-      /^(p|h[1-6]|ul|ol|table|blockquote|div|section)$/i.test(child.tagName)
-    );
-
-    if (!hasBlockChildren) {
-      const text = extractElementText(el);
-      if (text.trim()) target.push(text);
-      return;
-    }
-  }
-
-  if (tag === 'div' && el.classList.contains('document-region-label')) return;
-  if (tag === 'img' || tag === 'hr') return;
-
-  for (const child of Array.from(el.childNodes)) {
-    collectParagraphTexts(child, target, groups);
-  }
-}
-
-function extractElementText(node: Node): string {
-  if (node.nodeType === Node.TEXT_NODE) {
-    return node.textContent || '';
-  }
-
-  if (node.nodeType !== Node.ELEMENT_NODE) return '';
-  const el = node as HTMLElement;
-  const tag = el.tagName.toLowerCase();
-
-  if (tag === 'br') return '\n';
-  if (tag === 'img' || tag === 'hr') return '';
-  if (tag === 'div' && el.classList.contains('document-region-label')) return '';
-
-  let text = '';
-  for (const child of Array.from(el.childNodes)) {
-    text += extractElementText(child);
-  }
-
-  return normalizeHtmlParagraphText(text);
-}
-
-function normalizeHtmlParagraphText(text: string): string {
-  return text.replace(/\u00A0/g, ' ');
 }
 
 async function collectManifestXmlRefs(zip: JSZip): Promise<string[]> {

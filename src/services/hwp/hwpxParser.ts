@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import { XMLParser } from 'fast-xml-parser';
+import { computeParagraphSignature, extractParagraphGroupsFromHtml } from './exportPlan';
 import type {
   DocumentMetadata,
   HwpxExportContext,
@@ -38,6 +39,7 @@ interface HwpxParseContext {
 interface ParsedXmlContent {
   html: string;
   paragraphCount: number;
+  textSignature: string;
 }
 
 interface ExtractedContent {
@@ -127,6 +129,7 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
       path: headerPaths[i],
       region: 'header',
       paragraphCount: result.paragraphCount,
+      textSignature: result.textSignature,
     });
   }
 
@@ -134,19 +137,34 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
     for (const path of sectionPaths) {
       const result = await parseXmlFile(zip, path, ctx);
       if (result.html) htmlParts.push(result.html);
-      exportEntries.push({ path, region: 'body', paragraphCount: result.paragraphCount });
+      exportEntries.push({
+        path,
+        region: 'body',
+        paragraphCount: result.paragraphCount,
+        textSignature: result.textSignature,
+      });
     }
   } else if (fallbackSectionPaths.length > 0) {
     for (const path of fallbackSectionPaths) {
       const result = await parseXmlFile(zip, path, ctx);
       if (result.html) htmlParts.push(result.html);
-      exportEntries.push({ path, region: 'body', paragraphCount: result.paragraphCount });
+      exportEntries.push({
+        path,
+        region: 'body',
+        paragraphCount: result.paragraphCount,
+        textSignature: result.textSignature,
+      });
     }
   } else if (fallbackContentXmls.length > 0) {
     for (const path of fallbackContentXmls) {
       const result = await parseXmlFile(zip, path, ctx);
       if (result.html) htmlParts.push(result.html);
-      exportEntries.push({ path, region: 'body', paragraphCount: result.paragraphCount });
+      exportEntries.push({
+        path,
+        region: 'body',
+        paragraphCount: result.paragraphCount,
+        textSignature: result.textSignature,
+      });
     }
   } else {
     const contentXml = zip.file('Contents/content.xml');
@@ -158,6 +176,7 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
         path: 'Contents/content.xml',
         region: 'body',
         paragraphCount: fallback.paragraphCount,
+        textSignature: fallback.textSignature,
       });
     }
   }
@@ -169,6 +188,7 @@ async function extractContent(zip: JSZip, ctx: HwpxParseContext): Promise<Extrac
       path: footerPaths[i],
       region: 'footer',
       paragraphCount: result.paragraphCount,
+      textSignature: result.textSignature,
     });
   }
 
@@ -219,7 +239,7 @@ async function parseXmlFile(
   ctx: HwpxParseContext
 ) : Promise<ParsedXmlContent> {
   const file = zip.file(path);
-  if (!file) return { html: '', paragraphCount: 0 };
+  if (!file) return { html: '', paragraphCount: 0, textSignature: computeParagraphSignature([]) };
 
   const xml = await file.async('string');
   return parseXmlContent(xml, ctx);
@@ -233,7 +253,7 @@ async function parseRegionFile(
   ctx: HwpxParseContext
 ): Promise<ParsedXmlContent> {
   const file = zip.file(path);
-  if (!file) return { html: '', paragraphCount: 0 };
+  if (!file) return { html: '', paragraphCount: 0, textSignature: computeParagraphSignature([]) };
 
   const xml = await file.async('string');
   const content = parseXmlContent(xml, ctx);
@@ -243,6 +263,7 @@ async function parseRegionFile(
   return {
     html: wrapRegion(kind, title, content.html),
     paragraphCount: content.paragraphCount,
+    textSignature: content.textSignature,
   };
 }
 
@@ -253,19 +274,25 @@ function parseXmlContent(xml: string, ctx: HwpxParseContext): ParsedXmlContent {
     const paragraphCount = countParagraphNodes(parsed);
 
     if (html) {
-      return { html, paragraphCount };
+      return {
+        html,
+        paragraphCount,
+        textSignature: computeParagraphSignature(extractParagraphGroupsFromHtml(html).body),
+      };
     }
 
     const fallbackHtml = extractTextFromXml(xml);
     return {
       html: fallbackHtml,
       paragraphCount: fallbackHtml ? 1 : paragraphCount,
+      textSignature: computeParagraphSignature(extractParagraphGroupsFromHtml(fallbackHtml).body),
     };
   } catch {
     const fallbackHtml = extractTextFromXml(xml);
     return {
       html: fallbackHtml,
       paragraphCount: fallbackHtml ? 1 : 0,
+      textSignature: computeParagraphSignature(extractParagraphGroupsFromHtml(fallbackHtml).body),
     };
   }
 }

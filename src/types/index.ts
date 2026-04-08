@@ -13,6 +13,7 @@ export interface HwpxExportPlanEntry {
   path: string;
   region: 'body' | 'header' | 'footer';
   paragraphCount: number;
+  textSignature?: string;
 }
 
 export interface HwpxExportContext {

@@ -461,6 +461,7 @@ StarterKit 설정: `StarterKit.configure({ paragraph: false })` + 커스텀 `Par
 3. 각 XML 파일을 `fast-xml-parser(preserveOrder)`로 파싱
 4. 원본 XML의 문단(`hp:p`/`para`)을 순서대로 순회하면서 텍스트 노드만 교체
 5. 수정된 XML만 ZIP에 다시 넣어 `.hwpx`로 다운로드
+6. 파서가 저장한 파일별 문단 signature와 비교해 변경 없는 XML은 export 시 재파싱을 건너뜀
 
 이 방식의 목적은 다음과 같다.
 
