@@ -200,8 +200,19 @@ function patchXmlParagraphValues(xml: string, values: string[]): string {
     const parsed = orderedXmlParser.parse(xml) as OrderedNodes;
     const paragraphs = collectParagraphNodes(parsed);
 
-    for (let i = 0; i < paragraphs.length; i += 1) {
-      patchParagraphNodeText(paragraphs[i], values[i] ?? '');
+    let valueIndex = 0;
+    for (const paragraph of paragraphs) {
+      if (valueIndex >= values.length) break;
+
+      // Skip originally-empty paragraphs (spacing/line-breaks in the XML).
+      // They have no text content and no paragraph ID was assigned to them,
+      // so consuming a value slot here would shift all subsequent mappings.
+      const textNodes = collectTextLeafNodes(paragraph);
+      const hasOriginalText = textNodes.some((n) => String(n['#text'] ?? '').trim());
+      if (!hasOriginalText) continue;
+
+      patchParagraphNodeText(paragraph, values[valueIndex]);
+      valueIndex += 1;
     }
 
     return `${declaration}${orderedXmlBuilder.build(parsed)}`;
@@ -219,6 +230,12 @@ function patchXmlParagraphText(xml: string, cursor: ParagraphCursor): string {
 
     for (const paragraph of paragraphs) {
       if (cursor.index >= cursor.values.length) break;
+
+      // Skip originally-empty paragraphs (same fix as patchXmlParagraphValues).
+      const textNodes = collectTextLeafNodes(paragraph);
+      const hasOriginalText = textNodes.some((n) => String(n['#text'] ?? '').trim());
+      if (!hasOriginalText) continue;
+
       patchParagraphNodeText(paragraph, cursor.values[cursor.index]);
       cursor.index += 1;
     }
@@ -255,17 +272,12 @@ function patchParagraphNodeText(paragraph: OrderedNode, nextText: string): void 
     return;
   }
 
-  const originalLengths = textNodes.map((node) => String(node['#text'] ?? '').length);
-  let offset = 0;
-
-  for (let i = 0; i < textNodes.length; i += 1) {
-    const node = textNodes[i];
-    const take = i === textNodes.length - 1
-      ? normalizedText.length - offset
-      : Math.min(originalLengths[i], Math.max(0, normalizedText.length - offset));
-
-    node['#text'] = normalizedText.slice(offset, offset + Math.max(0, take));
-    offset += Math.max(0, take);
+  // Put the entire new text into the first text leaf node and clear the rest.
+  // Proportional splitting by original run lengths causes garbled output when the
+  // edited text differs significantly in length, so a single-run approach is safer.
+  textNodes[0]['#text'] = normalizedText;
+  for (let i = 1; i < textNodes.length; i += 1) {
+    textNodes[i]['#text'] = '';
   }
 }
 
@@ -644,20 +656,67 @@ ${runXml}
   </hp:p>`;
 }
 
+// ─── HWPX unit constants (1 HWPU = 1/100 mm) ─────────────────────────────────
+// 1pt = 25.4/72 mm → ×100 = 35.28 HWPU
+const PT_TO_HWPU = (25.4 / 72) * 100;
+const DEFAULT_TABLE_WIDTH_HWPU = 14000; // ≈140mm — standard A4 content width
+const DEFAULT_CELL_HEIGHT_HWPU = 850;   // ≈8.5mm row height
+const CELL_MARGIN_LR_HWPU = 510;        // ≈5.1mm left/right cell padding
+const CELL_MARGIN_TB_HWPU = 141;        // ≈1.4mm top/bottom cell padding
+
 function convertTable(table: HTMLElement): string {
   const rows = table.querySelectorAll('tr');
   if (rows.length === 0) return '';
 
+  // ── Determine column widths ──────────────────────────────────────────────
+  const colWidthsPt = parseTableColWidthsPt(table);
+
+  // Count logical columns from the first row's cells + spans
+  const firstRowCells = rows[0].querySelectorAll('td, th');
+  const totalCols = Math.max(
+    colWidthsPt?.length ?? 0,
+    Array.from(firstRowCells).reduce(
+      (sum, c) => sum + Math.max(1, parseInt(c.getAttribute('colspan') || '1', 10)),
+      0,
+    ),
+    1,
+  );
+
+  // Total table width in HWPU
+  const tableWidthHwpu = colWidthsPt
+    ? Math.round(colWidthsPt.reduce((s, w) => s + w, 0) * PT_TO_HWPU)
+    : DEFAULT_TABLE_WIDTH_HWPU;
+
+  // Per-column widths in HWPU
+  const colWidthsHwpu: number[] =
+    colWidthsPt && colWidthsPt.length === totalCols
+      ? colWidthsPt.map((w) => Math.max(500, Math.round(w * PT_TO_HWPU)))
+      : Array.from({ length: totalCols }, () =>
+          Math.max(500, Math.floor(tableWidthHwpu / totalCols)),
+        );
+
+  // ── Build rows/cells ─────────────────────────────────────────────────────
   const trXml: string[] = [];
+  let rowAddr = 0;
 
   for (const tr of Array.from(rows)) {
     const cells = tr.querySelectorAll('td, th');
     const tcXml: string[] = [];
+    let colAddr = 0;
 
     for (const cell of Array.from(cells)) {
-      const colspan = parseInt(cell.getAttribute('colspan') || '1', 10);
-      const rowspan = parseInt(cell.getAttribute('rowspan') || '1', 10);
+      const colspan = Math.max(1, parseInt(cell.getAttribute('colspan') || '1', 10));
+      const rowspan = Math.max(1, parseInt(cell.getAttribute('rowspan') || '1', 10));
 
+      // Cell width = sum of the spanned columns
+      const cellWidthHwpu = colWidthsHwpu
+        .slice(colAddr, colAddr + colspan)
+        .reduce((s, w) => s + w, 0);
+
+      const textWidthHwpu = Math.max(200, cellWidthHwpu - CELL_MARGIN_LR_HWPU * 2);
+      const textHeightHwpu = Math.max(100, DEFAULT_CELL_HEIGHT_HWPU - CELL_MARGIN_TB_HWPU * 2);
+
+      // Cell content paragraphs
       const cellParts: string[] = [];
       const blockEls = cell.querySelectorAll('p, h1, h2, h3, h4, h5, h6');
       if (blockEls.length > 0) {
@@ -666,21 +725,78 @@ function convertTable(table: HTMLElement): string {
         }
       } else {
         const runs = extractRuns(cell);
-        cellParts.push(wrapParagraph(runs.length > 0 ? runs : [{ text: cell.textContent || '', bold: false, italic: false, underline: false, strike: false, fontSize: 0 }]));
+        cellParts.push(
+          wrapParagraph(
+            runs.length > 0
+              ? runs
+              : [{ text: cell.textContent || '', bold: false, italic: false, underline: false, strike: false, fontSize: 0 }],
+          ),
+        );
+      }
+      if (cellParts.length === 0) {
+        cellParts.push('  <hp:p><hp:run><hp:t></hp:t></hp:run></hp:p>');
       }
 
-      const attrs: string[] = [];
-      if (colspan > 1) attrs.push(`colspan="${colspan}"`);
-      if (rowspan > 1) attrs.push(`rowspan="${rowspan}"`);
-      const attrStr = attrs.length > 0 ? ' ' + attrs.join(' ') : '';
+      tcXml.push(
+        [
+          `    <hp:tc name="" header="false" hasMargin="false" protect="false" editable="false" lineWrap="true" borderFill="0">`,
+          `      <hp:cellAddr colAddr="${colAddr}" rowAddr="${rowAddr}"/>`,
+          `      <hp:cellSpan colSpan="${colspan}" rowSpan="${rowspan}"/>`,
+          `      <hp:cellSz width="${cellWidthHwpu}" height="${DEFAULT_CELL_HEIGHT_HWPU}"/>`,
+          `      <hp:cellMargin left="${CELL_MARGIN_LR_HWPU}" right="${CELL_MARGIN_LR_HWPU}" top="${CELL_MARGIN_TB_HWPU}" bottom="${CELL_MARGIN_TB_HWPU}"/>`,
+          `      <hp:subList textDirection="LTRB" lineWrap="Break" vertAlign="Center" linkListIDRef="0" linkListNextIDRef="0" textWidth="${textWidthHwpu}" textHeight="${textHeightHwpu}">`,
+          cellParts.join('\n'),
+          `      </hp:subList>`,
+          `    </hp:tc>`,
+        ].join('\n'),
+      );
 
-      tcXml.push(`      <hp:tc${attrStr}>\n${cellParts.join('\n')}\n      </hp:tc>`);
+      colAddr += colspan;
     }
 
-    trXml.push(`    <hp:tr>\n${tcXml.join('\n')}\n    </hp:tr>`);
+    trXml.push(`  <hp:tr>\n${tcXml.join('\n')}\n  </hp:tr>`);
+    rowAddr += 1;
   }
 
-  return `  <hp:tbl>\n${trXml.join('\n')}\n  </hp:tbl>`;
+  const tableHeight = rows.length * DEFAULT_CELL_HEIGHT_HWPU;
+
+  return [
+    `<hp:tbl style="0" id="0" zOrder="0" lock="false" instantiate="false" numberingType="None" textWrap="TopAndBottom" blockReverse="false" allowOverlap="false" holdAnchorAndSO="false">`,
+    `  <hp:sz width="${tableWidthHwpu}" widthRelTo="Fixed" height="${tableHeight}" heightRelTo="Fixed" protect="false"/>`,
+    `  <hp:pos left="0" top="0"/>`,
+    `  <hp:outerMargin left="0" right="0" top="0" bottom="0"/>`,
+    ...trXml,
+    `</hp:tbl>`,
+  ].join('\n');
+}
+
+/**
+ * Extract per-column widths in pt from the table element.
+ * Tries data-hwp-col-widths first (set by HWP legacy/ODT parser),
+ * then falls back to <colgroup> col elements.
+ */
+function parseTableColWidthsPt(table: HTMLElement): number[] | null {
+  const raw = table.getAttribute('data-hwp-col-widths');
+  if (raw) {
+    const widths = raw
+      .split(',')
+      .map((w) => parseFloat(w.trim()))
+      .filter((w) => Number.isFinite(w) && w > 0);
+    if (widths.length > 0) return widths;
+  }
+
+  const cols = table.querySelectorAll('colgroup col');
+  if (cols.length > 0) {
+    const widths: number[] = [];
+    for (const col of Array.from(cols)) {
+      const style = col.getAttribute('style') || '';
+      const m = style.match(/width:\s*([\d.]+)pt/);
+      if (m) widths.push(parseFloat(m[1]));
+    }
+    if (widths.length === cols.length && widths.every((w) => w > 0)) return widths;
+  }
+
+  return null;
 }
 
 function convertList(list: HTMLElement, out: string[]): void {
