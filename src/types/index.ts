@@ -34,6 +34,10 @@ export interface ParsedDocument {
   rawZipData?: ArrayBuffer;
   /** Parser-derived path/order metadata for structure-preserving HWPX export */
   hwpxExportContext?: HwpxExportContext;
+  /** Raw ODT content.xml from pyhwp bridge — used for structure-preserving HWP → HWPX export */
+  rawOdtContentXml?: string;
+  /** Raw ODT styles.xml from pyhwp bridge */
+  rawOdtStylesXml?: string;
 }
 
 export interface DocumentMetadata {

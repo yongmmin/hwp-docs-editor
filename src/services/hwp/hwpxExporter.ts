@@ -3,6 +3,15 @@ import { XMLBuilder, XMLParser } from 'fast-xml-parser';
 import { computeParagraphSignature, extractParagraphGroupsFromHtml, extractParagraphTextById } from './exportPlan';
 import type { HwpxExportContext, HwpxExportPlanEntry } from '../../types';
 
+// ODT XML namespaces — mirrors odtParser.ts NS constants
+const ODT_NS = {
+  office: 'urn:oasis:names:tc:opendocument:xmlns:office:1.0',
+  text:   'urn:oasis:names:tc:opendocument:xmlns:text:1.0',
+  table:  'urn:oasis:names:tc:opendocument:xmlns:table:1.0',
+  style:  'urn:oasis:names:tc:opendocument:xmlns:style:1.0',
+  fo:     'urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0',
+} as const;
+
 type OrderedNode = Record<string, unknown>;
 type OrderedNodes = OrderedNode[];
 
@@ -33,19 +42,23 @@ const orderedXmlBuilder = new XMLBuilder({
  * Export edited content back to HWPX format.
  *
  * Strategy:
- * - HWPX: keep the original package and patch paragraph text back into the
- *   original XML files so tables/images/layout survive the round-trip.
- * - HWP: create a minimal HWPX package as a fallback.
+ * - HWPX origin: keep the original package and patch paragraph text back into
+ *   the original XML files so tables/images/layout survive the round-trip.
+ * - HWP origin with ODT data: convert ODT XML → HWPX using structural data
+ *   from pyhwp (column widths, cell spans) combined with user's edited text.
+ * - HWP origin without ODT data (fallback): generate minimal HWPX from HTML.
  */
 export async function exportToHwpx(
   html: string,
   originalZipData?: ArrayBuffer,
-  exportContext?: HwpxExportContext
+  exportContext?: HwpxExportContext,
+  rawOdtContentXml?: string,
+  rawOdtStylesXml?: string,
 ): Promise<Blob> {
   if (originalZipData) {
     return exportWithOriginalStructure(html, originalZipData, exportContext);
   }
-  return exportMinimalHwpx(html);
+  return exportMinimalHwpx(html, rawOdtContentXml, rawOdtStylesXml);
 }
 
 async function exportWithOriginalStructure(
@@ -331,7 +344,11 @@ function normalizePatchedText(text: string): string {
   return text.replace(/\u00A0/g, ' ').replace(/\r\n?/g, '\n');
 }
 
-async function exportMinimalHwpx(html: string): Promise<Blob> {
+async function exportMinimalHwpx(
+  html: string,
+  rawOdtContentXml?: string,
+  rawOdtStylesXml?: string,
+): Promise<Blob> {
   const zip = new JSZip();
 
   zip.file('mimetype', 'application/hwp+zip');
@@ -348,7 +365,14 @@ async function exportMinimalHwpx(html: string): Promise<Blob> {
   <hp:mainSection href="sec0.xml"/>
 </hp:package>`);
 
-  zip.file('Contents/sec0.xml', htmlToHwpxSection(html));
+  // When ODT data is available (HWP origin with pyhwp bridge), use it for
+  // structure-preserving export: ODT provides exact table geometry while
+  // the edited HTML provides the user's updated text.
+  const sectionXml = rawOdtContentXml
+    ? odtToHwpxSection(rawOdtContentXml, rawOdtStylesXml ?? '', html)
+    : htmlToHwpxSection(html);
+
+  zip.file('Contents/sec0.xml', sectionXml);
 
   return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
 }
@@ -829,4 +853,300 @@ function escapeXml(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ODT XML → HWPX section XML
+//
+// Converts pyhwp bridge output (ODT content.xml + styles.xml) directly to a
+// HWPX section XML. Uses ODT for structural data (table column widths, cell
+// spans) which are lost when going through HTML. User's edited text from the
+// TipTap HTML is injected in document order, replacing ODT's original text.
+//
+// Why: HTML → HWPX is lossy. ODT has exact cell widths, border info, span
+// coordinates. Going ODT → HWPX directly preserves all structural fidelity.
+// ──────────────────────────────────────────────────────────────────────────────
+
+interface OdtExportStyles {
+  // text style name → formatting flags
+  textStyles: Map<string, { bold?: boolean; italic?: boolean; underline?: boolean; fontSize?: number }>;
+  // table-column style name → width in pt
+  colStyles: Map<string, number>;
+}
+
+function collectOdtExportStyles(contentDoc: Document, stylesDoc: Document): OdtExportStyles {
+  const textStyles = new Map<string, { bold?: boolean; italic?: boolean; underline?: boolean; fontSize?: number }>();
+  const colStyles = new Map<string, number>();
+
+  const sources = [
+    contentDoc.getElementsByTagNameNS(ODT_NS.office, 'automatic-styles')[0],
+    contentDoc.getElementsByTagNameNS(ODT_NS.office, 'styles')[0],
+    stylesDoc.getElementsByTagNameNS(ODT_NS.office, 'automatic-styles')[0],
+    stylesDoc.getElementsByTagNameNS(ODT_NS.office, 'styles')[0],
+  ];
+
+  for (const container of sources) {
+    if (!container) continue;
+
+    for (const styleEl of Array.from(container.getElementsByTagNameNS(ODT_NS.style, 'style'))) {
+      const name = styleEl.getAttributeNS(ODT_NS.style, 'name') || '';
+      const family = styleEl.getAttributeNS(ODT_NS.style, 'family') || '';
+      if (!name) continue;
+
+      if (family === 'text' && !textStyles.has(name)) {
+        const props = styleEl.getElementsByTagNameNS(ODT_NS.style, 'text-properties')[0];
+        if (!props) continue;
+        const ts: { bold?: boolean; italic?: boolean; underline?: boolean; fontSize?: number } = {};
+        if (props.getAttributeNS(ODT_NS.fo, 'font-weight') === 'bold') ts.bold = true;
+        if (props.getAttributeNS(ODT_NS.fo, 'font-style') === 'italic') ts.italic = true;
+        const ul = props.getAttributeNS(ODT_NS.style, 'text-underline-type') ||
+                   props.getAttributeNS(ODT_NS.style, 'text-underline-style');
+        if (ul && ul !== 'none') ts.underline = true;
+        const fs = props.getAttributeNS(ODT_NS.fo, 'font-size');
+        if (fs) {
+          const m = fs.match(/^([\d.]+)pt$/);
+          if (m) ts.fontSize = parseFloat(m[1]);
+        }
+        if (Object.keys(ts).length > 0) textStyles.set(name, ts);
+
+      } else if (family === 'table-column' && !colStyles.has(name)) {
+        const props = styleEl.getElementsByTagNameNS(ODT_NS.style, 'table-column-properties')[0];
+        if (!props) continue;
+        const w = props.getAttributeNS(ODT_NS.style, 'column-width');
+        if (w) {
+          const pt = odtLengthToPt(w);
+          if (pt > 0) colStyles.set(name, pt);
+        }
+      }
+    }
+  }
+
+  return { textStyles, colStyles };
+}
+
+function odtLengthToPt(value: string): number {
+  const num = parseFloat(value);
+  if (isNaN(num)) return -1;
+  if (value.endsWith('pt')) return num;
+  if (value.endsWith('mm')) return num * 2.83465;
+  if (value.endsWith('cm')) return num * 28.3465;
+  if (value.endsWith('in')) return num * 72;
+  return -1;
+}
+
+/**
+ * Convert ODT XML (from pyhwp bridge) to a HWPX section XML string.
+ *
+ * @param contentXml  ODT content.xml string
+ * @param stylesXml   ODT styles.xml string
+ * @param editedHtml  TipTap innerHTML — provides user-edited text in document order
+ */
+function odtToHwpxSection(contentXml: string, stylesXml: string, editedHtml: string): string {
+  const domParser = new DOMParser();
+  const contentDoc = domParser.parseFromString(contentXml, 'application/xml');
+  const stylesDoc = stylesXml
+    ? domParser.parseFromString(stylesXml, 'application/xml')
+    : contentDoc;
+
+  const exportStyles = collectOdtExportStyles(contentDoc, stylesDoc);
+
+  // Build an ordered queue of paragraph texts from the user's edited HTML.
+  // extractParagraphGroupsFromHtml traverses in document order including cell
+  // paragraphs, matching the same order as ODT's office:text traversal.
+  const textQueue = extractParagraphGroupsFromHtml(editedHtml).body;
+  const cursor = { index: 0 };
+
+  const officeText = contentDoc.getElementsByTagNameNS(ODT_NS.office, 'text')[0];
+  if (!officeText) {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
+        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
+  <hp:p><hp:run><hp:t></hp:t></hp:run></hp:p>
+</hs:sec>`;
+  }
+
+  const parts: string[] = [];
+  odtChildrenToHwpx(officeText, exportStyles, textQueue, cursor, parts);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
+        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
+${parts.join('\n')}
+</hs:sec>`;
+}
+
+/** Recursively convert ODT child elements to HWPX XML strings. */
+function odtChildrenToHwpx(
+  parent: Element,
+  styles: OdtExportStyles,
+  textQueue: string[],
+  cursor: { index: number },
+  out: string[],
+): void {
+  for (const child of Array.from(parent.childNodes)) {
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const el = child as Element;
+    const ns = el.namespaceURI;
+    const tag = el.localName;
+
+    if (ns === ODT_NS.text && (tag === 'p' || tag === 'h')) {
+      // Consume next text from the queue (user's edited version of this paragraph).
+      // Use empty paragraph when queue is exhausted or text is empty.
+      const text = cursor.index < textQueue.length ? textQueue[cursor.index++] : '';
+      out.push(text.trim()
+        ? wrapParagraph([{ text, bold: false, italic: false, underline: false, strike: false, fontSize: 0 }])
+        : wrapParagraph([]),
+      );
+    } else if (ns === ODT_NS.table && tag === 'table') {
+      out.push(odtTableNodeToHwpx(el, styles, textQueue, cursor));
+    } else if (ns === ODT_NS.text && tag === 'soft-page-break') {
+      // Skip soft page breaks — don't consume from queue
+    } else {
+      // Recurse for text:section, text:sequence-decls, office:forms, etc.
+      odtChildrenToHwpx(el, styles, textQueue, cursor, out);
+    }
+  }
+}
+
+/** Convert an ODT table element to a HWPX hp:tbl XML string. */
+function odtTableNodeToHwpx(
+  tableEl: Element,
+  styles: OdtExportStyles,
+  textQueue: string[],
+  cursor: { index: number },
+): string {
+  // ── Collect column widths from ODT table-column declarations ───────────────
+  const colWidthsPt: number[] = [];
+  const rows: Element[] = [];
+
+  for (const child of Array.from(tableEl.childNodes)) {
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const el = child as Element;
+    if (el.namespaceURI !== ODT_NS.table) continue;
+
+    if (el.localName === 'table-column') {
+      const repeat = Math.max(1, parseInt(el.getAttributeNS(ODT_NS.table, 'number-columns-repeated') || '1', 10));
+      const styleName = el.getAttributeNS(ODT_NS.table, 'style-name') || '';
+      const widthPt = styles.colStyles.get(styleName) ?? -1;
+      for (let i = 0; i < repeat; i++) colWidthsPt.push(widthPt);
+
+    } else if (el.localName === 'table-row') {
+      rows.push(el);
+
+    } else if (['table-row-group', 'table-header-rows', 'table-rows', 'table-footer-rows'].includes(el.localName)) {
+      for (const rowChild of Array.from(el.childNodes)) {
+        if (rowChild.nodeType === Node.ELEMENT_NODE) {
+          const rowEl = rowChild as Element;
+          if (rowEl.namespaceURI === ODT_NS.table && rowEl.localName === 'table-row') {
+            rows.push(rowEl);
+          }
+        }
+      }
+    }
+  }
+
+  if (rows.length === 0) return '';
+
+  // ── Compute HWPU column widths ─────────────────────────────────────────────
+  const totalCols = colWidthsPt.length || 1;
+  const hasActualWidths = colWidthsPt.length > 0 && colWidthsPt.every(w => w > 0);
+
+  const tableWidthHwpu = hasActualWidths
+    ? Math.round(colWidthsPt.reduce((s, w) => s + w, 0) * PT_TO_HWPU)
+    : DEFAULT_TABLE_WIDTH_HWPU;
+
+  const colWidthsHwpu: number[] = hasActualWidths
+    ? colWidthsPt.map(w => Math.max(500, Math.round(w * PT_TO_HWPU)))
+    : Array.from({ length: totalCols }, () => Math.max(500, Math.floor(tableWidthHwpu / totalCols)));
+
+  // ── Build rows ─────────────────────────────────────────────────────────────
+  const trXml: string[] = [];
+  let rowAddr = 0;
+
+  for (const row of rows) {
+    const tcXml: string[] = [];
+    let colAddr = 0;
+
+    for (const child of Array.from(row.childNodes)) {
+      if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      const cell = child as Element;
+      if (cell.namespaceURI !== ODT_NS.table) continue;
+
+      // covered-table-cell = occupied by a spanning cell — skip but track colAddr
+      if (cell.localName === 'covered-table-cell') {
+        const repeat = Math.max(1, parseInt(cell.getAttributeNS(ODT_NS.table, 'number-columns-repeated') || '1', 10));
+        colAddr += repeat;
+        continue;
+      }
+      if (cell.localName !== 'table-cell') continue;
+
+      const colspan = Math.max(1, parseInt(cell.getAttributeNS(ODT_NS.table, 'number-columns-spanned') || '1', 10));
+      const rowspan = Math.max(1, parseInt(cell.getAttributeNS(ODT_NS.table, 'number-rows-spanned') || '1', 10));
+      // number-columns-repeated: emit N identical cells (rare in HWP tables)
+      const colRepeat = Math.max(1, parseInt(cell.getAttributeNS(ODT_NS.table, 'number-columns-repeated') || '1', 10));
+
+      for (let r = 0; r < colRepeat; r++) {
+        const effectiveColAddr = colAddr + r * colspan;
+        const cellWidthHwpu = Math.max(500,
+          colWidthsHwpu.slice(effectiveColAddr, effectiveColAddr + colspan).reduce((s, w) => s + w, 0),
+        );
+
+        const cellMarginLR = Math.max(141, Math.floor(cellWidthHwpu * 0.01));
+        const textWidthHwpu = Math.max(200, cellWidthHwpu - cellMarginLR * 2);
+        const textHeightHwpu = Math.max(100, DEFAULT_CELL_HEIGHT_HWPU - CELL_MARGIN_TB_HWPU * 2);
+
+        // Build cell paragraphs: each text:p in the cell consumes one slot from the queue
+        const cellParts: string[] = [];
+        for (const cellChild of Array.from(cell.childNodes)) {
+          if (cellChild.nodeType !== Node.ELEMENT_NODE) continue;
+          const cellChildEl = cellChild as Element;
+          if (cellChildEl.namespaceURI === ODT_NS.text &&
+              (cellChildEl.localName === 'p' || cellChildEl.localName === 'h')) {
+            const text = cursor.index < textQueue.length ? textQueue[cursor.index++] : '';
+            cellParts.push(text.trim()
+              ? wrapParagraph([{ text, bold: false, italic: false, underline: false, strike: false, fontSize: 0 }])
+              : wrapParagraph([]),
+            );
+          }
+        }
+        if (cellParts.length === 0) {
+          cellParts.push('  <hp:p><hp:run><hp:t></hp:t></hp:run></hp:p>');
+        }
+
+        tcXml.push([
+          `    <hp:tc name="" header="false" hasMargin="false" protect="false" editable="false" lineWrap="true" borderFill="0">`,
+          `      <hp:cellAddr colAddr="${effectiveColAddr}" rowAddr="${rowAddr}"/>`,
+          `      <hp:cellSpan colSpan="${colspan}" rowSpan="${rowspan}"/>`,
+          `      <hp:cellSz width="${cellWidthHwpu}" height="${DEFAULT_CELL_HEIGHT_HWPU}"/>`,
+          `      <hp:cellMargin left="${cellMarginLR}" right="${cellMarginLR}" top="${CELL_MARGIN_TB_HWPU}" bottom="${CELL_MARGIN_TB_HWPU}"/>`,
+          `      <hp:subList textDirection="LTRB" lineWrap="Break" vertAlign="Center" linkListIDRef="0" linkListNextIDRef="0" textWidth="${textWidthHwpu}" textHeight="${textHeightHwpu}">`,
+          cellParts.join('\n'),
+          `      </hp:subList>`,
+          `    </hp:tc>`,
+        ].join('\n'));
+      }
+
+      colAddr += colspan * colRepeat;
+    }
+
+    if (tcXml.length > 0) {
+      trXml.push(`  <hp:tr>\n${tcXml.join('\n')}\n  </hp:tr>`);
+    }
+    rowAddr += 1;
+  }
+
+  if (trXml.length === 0) return '';
+
+  const tableHeight = rows.length * DEFAULT_CELL_HEIGHT_HWPU;
+
+  return [
+    `<hp:tbl style="0" id="0" zOrder="0" lock="false" instantiate="false" numberingType="None" textWrap="TopAndBottom" blockReverse="false" allowOverlap="false" holdAnchorAndSO="false" widthRelTo="Para" horzRelTo="Para" vertRelTo="Para">`,
+    `  <hp:sz width="${tableWidthHwpu}" widthRelTo="Fixed" height="${tableHeight}" heightRelTo="Fixed" protect="false"/>`,
+    `  <hp:pos left="0" top="0" leftRelTo="Para" topRelTo="Para" vertAlign="Top" horzAlign="Left"/>`,
+    `  <hp:outerMargin left="0" right="0" top="0" bottom="0"/>`,
+    ...trXml,
+    `</hp:tbl>`,
+  ].join('\n');
 }
