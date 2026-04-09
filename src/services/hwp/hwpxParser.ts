@@ -298,6 +298,9 @@ async function parseRegionFile(
 
 function parseXmlContent(xml: string, ctx: HwpxParseContext, path: string): ParsedXmlContent {
   try {
+    // ── diagnostic ──────────────────────────────────────────────────────────
+    console.log('[import] parseXmlContent:', path, '| xml:', xml.length, 'chars | has hp:tbl:', xml.includes('hp:tbl'));
+    // ────────────────────────────────────────────────────────────────────────
     const parsed = orderedXmlParser.parse(xml) as OrderedNodes;
     const renderState: ParagraphRenderState = {
       path,
@@ -307,6 +310,10 @@ function parseXmlContent(xml: string, ctx: HwpxParseContext, path: string): Pars
     };
     const html = renderBlocks(parsed, ctx, renderState).join('');
     const paragraphCount = renderState.paragraphIds.length;
+
+    // ── diagnostic ──────────────────────────────────────────────────────────
+    console.log('[import] rendered html:', html.length, 'chars | has <table:', html.includes('<table'), '| first 300:', html.substring(0, 300));
+    // ────────────────────────────────────────────────────────────────────────
 
     if (html) {
       return {
