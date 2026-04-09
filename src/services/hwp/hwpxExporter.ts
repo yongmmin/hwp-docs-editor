@@ -365,12 +365,17 @@ async function exportMinimalHwpx(
   <hp:mainSection href="sec0.xml"/>
 </hp:package>`);
 
-  // When ODT data is available (HWP origin with pyhwp bridge), use it for
-  // structure-preserving export: ODT provides exact table geometry while
-  // the edited HTML provides the user's updated text.
-  const sectionXml = rawOdtContentXml
-    ? odtToHwpxSection(rawOdtContentXml, rawOdtStylesXml ?? '', html)
-    : htmlToHwpxSection(html);
+  // When ODT data is available (HWP origin with pyhwp bridge), attempt the
+  // ODT-based conversion first (preserves exact table geometry). If ODT path
+  // fails or produces no meaningful content, fall back to the HTML path which
+  // reads data-hwp-col-widths preserved by TipTap's Table extension.
+  let sectionXml: string;
+  if (rawOdtContentXml) {
+    const odtResult = tryOdtToHwpxSection(rawOdtContentXml, rawOdtStylesXml ?? '', html);
+    sectionXml = odtResult ?? htmlToHwpxSection(html);
+  } else {
+    sectionXml = htmlToHwpxSection(html);
+  }
 
   zip.file('Contents/sec0.xml', sectionXml);
 
@@ -881,35 +886,56 @@ interface OdtExportStyles {
   colStyles: Map<string, number>;
 }
 
+/** Get an attribute from an element, trying namespaced then non-namespaced forms. */
+function getOdtAttr(el: Element, ns: string, localName: string): string {
+  return el.getAttributeNS(ns, localName) ||
+         el.getAttribute(`${localName}`) ||
+         '';
+}
+
 function collectOdtExportStyles(contentDoc: Document, stylesDoc: Document): OdtExportStyles {
   const textStyles = new Map<string, { bold?: boolean; italic?: boolean; underline?: boolean; fontSize?: number }>();
   const colStyles = new Map<string, number>();
 
+  // Collect style containers — try namespace-aware lookup first, then by tag name
+  function getContainers(doc: Document, localName: string): Element[] {
+    const byNs = doc.getElementsByTagNameNS(ODT_NS.office, localName);
+    if (byNs.length > 0) return Array.from(byNs);
+    const byTag = doc.getElementsByTagName(`office:${localName}`);
+    return Array.from(byTag);
+  }
+
   const sources = [
-    contentDoc.getElementsByTagNameNS(ODT_NS.office, 'automatic-styles')[0],
-    contentDoc.getElementsByTagNameNS(ODT_NS.office, 'styles')[0],
-    stylesDoc.getElementsByTagNameNS(ODT_NS.office, 'automatic-styles')[0],
-    stylesDoc.getElementsByTagNameNS(ODT_NS.office, 'styles')[0],
+    ...getContainers(contentDoc, 'automatic-styles'),
+    ...getContainers(contentDoc, 'styles'),
+    ...getContainers(stylesDoc, 'automatic-styles'),
+    ...getContainers(stylesDoc, 'styles'),
   ];
 
   for (const container of sources) {
-    if (!container) continue;
+    // style:style elements — try namespace-aware, then by tag name
+    const styleEls = container.getElementsByTagNameNS(ODT_NS.style, 'style').length > 0
+      ? Array.from(container.getElementsByTagNameNS(ODT_NS.style, 'style'))
+      : Array.from(container.getElementsByTagName('style:style'));
 
-    for (const styleEl of Array.from(container.getElementsByTagNameNS(ODT_NS.style, 'style'))) {
-      const name = styleEl.getAttributeNS(ODT_NS.style, 'name') || '';
-      const family = styleEl.getAttributeNS(ODT_NS.style, 'family') || '';
+    for (const styleEl of styleEls) {
+      const name = getOdtAttr(styleEl, ODT_NS.style, 'name');
+      const family = getOdtAttr(styleEl, ODT_NS.style, 'family');
       if (!name) continue;
 
       if (family === 'text' && !textStyles.has(name)) {
-        const props = styleEl.getElementsByTagNameNS(ODT_NS.style, 'text-properties')[0];
+        const propsByNs = styleEl.getElementsByTagNameNS(ODT_NS.style, 'text-properties');
+        const props = propsByNs.length > 0
+          ? propsByNs[0]
+          : styleEl.getElementsByTagName('style:text-properties')[0];
         if (!props) continue;
         const ts: { bold?: boolean; italic?: boolean; underline?: boolean; fontSize?: number } = {};
-        if (props.getAttributeNS(ODT_NS.fo, 'font-weight') === 'bold') ts.bold = true;
-        if (props.getAttributeNS(ODT_NS.fo, 'font-style') === 'italic') ts.italic = true;
-        const ul = props.getAttributeNS(ODT_NS.style, 'text-underline-type') ||
-                   props.getAttributeNS(ODT_NS.style, 'text-underline-style');
+        if (getOdtAttr(props, ODT_NS.fo, 'font-weight') === 'bold') ts.bold = true;
+        if (getOdtAttr(props, ODT_NS.fo, 'font-style') === 'italic') ts.italic = true;
+        const ul = getOdtAttr(props, ODT_NS.style, 'text-underline-type') ||
+                   getOdtAttr(props, ODT_NS.style, 'text-underline-style');
         if (ul && ul !== 'none') ts.underline = true;
-        const fs = props.getAttributeNS(ODT_NS.fo, 'font-size');
+        const fs = getOdtAttr(props, ODT_NS.fo, 'font-size');
         if (fs) {
           const m = fs.match(/^([\d.]+)pt$/);
           if (m) ts.fontSize = parseFloat(m[1]);
@@ -917,9 +943,12 @@ function collectOdtExportStyles(contentDoc: Document, stylesDoc: Document): OdtE
         if (Object.keys(ts).length > 0) textStyles.set(name, ts);
 
       } else if (family === 'table-column' && !colStyles.has(name)) {
-        const props = styleEl.getElementsByTagNameNS(ODT_NS.style, 'table-column-properties')[0];
+        const propsByNs = styleEl.getElementsByTagNameNS(ODT_NS.style, 'table-column-properties');
+        const props = propsByNs.length > 0
+          ? propsByNs[0]
+          : styleEl.getElementsByTagName('style:table-column-properties')[0];
         if (!props) continue;
-        const w = props.getAttributeNS(ODT_NS.style, 'column-width');
+        const w = getOdtAttr(props, ODT_NS.style, 'column-width');
         if (w) {
           const pt = odtLengthToPt(w);
           if (pt > 0) colStyles.set(name, pt);
@@ -942,16 +971,37 @@ function odtLengthToPt(value: string): number {
 }
 
 /**
- * Convert ODT XML (from pyhwp bridge) to a HWPX section XML string.
+ * Attempt to convert ODT XML to a HWPX section XML string.
+ * Returns null when the conversion produces no meaningful content so the caller
+ * can fall back to the HTML path.
  *
  * @param contentXml  ODT content.xml string
  * @param stylesXml   ODT styles.xml string
  * @param editedHtml  TipTap innerHTML — provides user-edited text in document order
  */
-function odtToHwpxSection(contentXml: string, stylesXml: string, editedHtml: string): string {
+function tryOdtToHwpxSection(contentXml: string, stylesXml: string, editedHtml: string): string | null {
+  try {
+    return odtToHwpxSection(contentXml, stylesXml, editedHtml);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Convert ODT XML (from pyhwp bridge) to a HWPX section XML string.
+ * Returns null when office:text cannot be located (signals caller to fall back).
+ */
+function odtToHwpxSection(contentXml: string, stylesXml: string, editedHtml: string): string | null {
   _sectionObjectIdCounter = 0; // reset per section
   const domParser = new DOMParser();
   const contentDoc = domParser.parseFromString(contentXml, 'application/xml');
+
+  // Bail out if DOMParser returned a parse-error document
+  if (contentDoc.documentElement?.tagName === 'parsererror' ||
+      contentDoc.getElementsByTagName('parsererror').length > 0) {
+    return null;
+  }
+
   const stylesDoc = stylesXml
     ? domParser.parseFromString(stylesXml, 'application/xml')
     : contentDoc;
@@ -964,18 +1014,22 @@ function odtToHwpxSection(contentXml: string, stylesXml: string, editedHtml: str
   const textQueue = extractParagraphGroupsFromHtml(editedHtml).body;
   const cursor = { index: 0 };
 
-  const officeText = contentDoc.getElementsByTagNameNS(ODT_NS.office, 'text')[0];
-  if (!officeText) {
-    return `<?xml version="1.0" encoding="UTF-8"?>
-<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
-        xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
-        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
-  <hp:p><hp:run><hp:t></hp:t></hp:run></hp:p>
-</hs:sec>`;
-  }
+  // Try namespace-aware lookup first; fall back to local-name search for
+  // parsers that strip namespace URIs.
+  const officeText: Element | undefined =
+    contentDoc.getElementsByTagNameNS(ODT_NS.office, 'text')[0] ??
+    Array.from(contentDoc.getElementsByTagName('office:text'))[0] ??
+    Array.from(contentDoc.getElementsByTagName('*')).find(
+      (el) => el.localName === 'text' && el.parentElement?.localName === 'body',
+    );
+
+  if (!officeText) return null;
 
   const parts: string[] = [];
   odtChildrenToHwpx(officeText, exportStyles, textQueue, cursor, parts);
+
+  // If ODT traversal produced no output at all, signal failure so caller falls back.
+  if (parts.length === 0) return null;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"
@@ -983,6 +1037,11 @@ function odtToHwpxSection(contentXml: string, stylesXml: string, editedHtml: str
         xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
 ${parts.join('\n')}
 </hs:sec>`;
+}
+
+/** Check if an element belongs to an ODT namespace — by URI or by prefix fallback. */
+function isOdtNs(el: Element, ns: string, prefix: string): boolean {
+  return el.namespaceURI === ns || el.tagName.startsWith(`${prefix}:`);
 }
 
 /** Recursively convert ODT child elements to HWPX XML strings. */
@@ -996,10 +1055,9 @@ function odtChildrenToHwpx(
   for (const child of Array.from(parent.childNodes)) {
     if (child.nodeType !== Node.ELEMENT_NODE) continue;
     const el = child as Element;
-    const ns = el.namespaceURI;
     const tag = el.localName;
 
-    if (ns === ODT_NS.text && (tag === 'p' || tag === 'h')) {
+    if (isOdtNs(el, ODT_NS.text, 'text') && (tag === 'p' || tag === 'h')) {
       // Consume next text from the queue (user's edited version of this paragraph).
       // Use empty paragraph when queue is exhausted or text is empty.
       const text = cursor.index < textQueue.length ? textQueue[cursor.index++] : '';
@@ -1007,9 +1065,10 @@ function odtChildrenToHwpx(
         ? wrapParagraph([{ text, bold: false, italic: false, underline: false, strike: false, fontSize: 0 }])
         : wrapParagraph([]),
       );
-    } else if (ns === ODT_NS.table && tag === 'table') {
-      out.push(odtTableNodeToHwpx(el, styles, textQueue, cursor));
-    } else if (ns === ODT_NS.text && tag === 'soft-page-break') {
+    } else if (isOdtNs(el, ODT_NS.table, 'table') && tag === 'table') {
+      const tblXml = odtTableNodeToHwpx(el, styles, textQueue, cursor);
+      if (tblXml) out.push(tblXml);
+    } else if (isOdtNs(el, ODT_NS.text, 'text') && tag === 'soft-page-break') {
       // Skip soft page breaks — don't consume from queue
     } else {
       // Recurse for text:section, text:sequence-decls, office:forms, etc.
@@ -1032,11 +1091,11 @@ function odtTableNodeToHwpx(
   for (const child of Array.from(tableEl.childNodes)) {
     if (child.nodeType !== Node.ELEMENT_NODE) continue;
     const el = child as Element;
-    if (el.namespaceURI !== ODT_NS.table) continue;
+    if (!isOdtNs(el, ODT_NS.table, 'table')) continue;
 
     if (el.localName === 'table-column') {
-      const repeat = Math.max(1, parseInt(el.getAttributeNS(ODT_NS.table, 'number-columns-repeated') || '1', 10));
-      const styleName = el.getAttributeNS(ODT_NS.table, 'style-name') || '';
+      const repeat = Math.max(1, parseInt(getOdtAttr(el, ODT_NS.table, 'number-columns-repeated') || '1', 10));
+      const styleName = getOdtAttr(el, ODT_NS.table, 'style-name');
       const widthPt = styles.colStyles.get(styleName) ?? -1;
       for (let i = 0; i < repeat; i++) colWidthsPt.push(widthPt);
 
@@ -1047,7 +1106,7 @@ function odtTableNodeToHwpx(
       for (const rowChild of Array.from(el.childNodes)) {
         if (rowChild.nodeType === Node.ELEMENT_NODE) {
           const rowEl = rowChild as Element;
-          if (rowEl.namespaceURI === ODT_NS.table && rowEl.localName === 'table-row') {
+          if (isOdtNs(rowEl, ODT_NS.table, 'table') && rowEl.localName === 'table-row') {
             rows.push(rowEl);
           }
         }
@@ -1080,20 +1139,20 @@ function odtTableNodeToHwpx(
     for (const child of Array.from(row.childNodes)) {
       if (child.nodeType !== Node.ELEMENT_NODE) continue;
       const cell = child as Element;
-      if (cell.namespaceURI !== ODT_NS.table) continue;
+      if (!isOdtNs(cell, ODT_NS.table, 'table')) continue;
 
       // covered-table-cell = occupied by a spanning cell — skip but track colAddr
       if (cell.localName === 'covered-table-cell') {
-        const repeat = Math.max(1, parseInt(cell.getAttributeNS(ODT_NS.table, 'number-columns-repeated') || '1', 10));
+        const repeat = Math.max(1, parseInt(getOdtAttr(cell, ODT_NS.table, 'number-columns-repeated') || '1', 10));
         colAddr += repeat;
         continue;
       }
       if (cell.localName !== 'table-cell') continue;
 
-      const colspan = Math.max(1, parseInt(cell.getAttributeNS(ODT_NS.table, 'number-columns-spanned') || '1', 10));
-      const rowspan = Math.max(1, parseInt(cell.getAttributeNS(ODT_NS.table, 'number-rows-spanned') || '1', 10));
+      const colspan = Math.max(1, parseInt(getOdtAttr(cell, ODT_NS.table, 'number-columns-spanned') || '1', 10));
+      const rowspan = Math.max(1, parseInt(getOdtAttr(cell, ODT_NS.table, 'number-rows-spanned') || '1', 10));
       // number-columns-repeated: emit N identical cells (rare in HWP tables)
-      const colRepeat = Math.max(1, parseInt(cell.getAttributeNS(ODT_NS.table, 'number-columns-repeated') || '1', 10));
+      const colRepeat = Math.max(1, parseInt(getOdtAttr(cell, ODT_NS.table, 'number-columns-repeated') || '1', 10));
 
       for (let r = 0; r < colRepeat; r++) {
         const effectiveColAddr = colAddr + r * colspan;
@@ -1110,7 +1169,7 @@ function odtTableNodeToHwpx(
         for (const cellChild of Array.from(cell.childNodes)) {
           if (cellChild.nodeType !== Node.ELEMENT_NODE) continue;
           const cellChildEl = cellChild as Element;
-          if (cellChildEl.namespaceURI === ODT_NS.text &&
+          if (isOdtNs(cellChildEl, ODT_NS.text, 'text') &&
               (cellChildEl.localName === 'p' || cellChildEl.localName === 'h')) {
             const text = cursor.index < textQueue.length ? textQueue[cursor.index++] : '';
             cellParts.push(text.trim()
