@@ -661,7 +661,8 @@ ${runXml}
 const PT_TO_HWPU = (25.4 / 72) * 100;
 const DEFAULT_TABLE_WIDTH_HWPU = 14000; // ≈140mm — standard A4 content width
 const DEFAULT_CELL_HEIGHT_HWPU = 850;   // ≈8.5mm row height
-const CELL_MARGIN_LR_HWPU = 510;        // ≈5.1mm left/right cell padding
+// Cell margin: use 1% of cell width (adaptive) with 141 HWPU floor.
+// Fixed 510 HWPU (5.1mm) consumed 51% of a 2000 HWPU narrow cell, causing wrapping.
 const CELL_MARGIN_TB_HWPU = 141;        // ≈1.4mm top/bottom cell padding
 
 function convertTable(table: HTMLElement): string {
@@ -713,7 +714,10 @@ function convertTable(table: HTMLElement): string {
         .slice(colAddr, colAddr + colspan)
         .reduce((s, w) => s + w, 0);
 
-      const textWidthHwpu = Math.max(200, cellWidthHwpu - CELL_MARGIN_LR_HWPU * 2);
+      // Adaptive left/right margin: 1% of cell width, but at least 141 HWPU (1.4mm).
+      // Avoids consuming too much space in narrow cells.
+      const cellMarginLR = Math.max(141, Math.floor(cellWidthHwpu * 0.01));
+      const textWidthHwpu = Math.max(200, cellWidthHwpu - cellMarginLR * 2);
       const textHeightHwpu = Math.max(100, DEFAULT_CELL_HEIGHT_HWPU - CELL_MARGIN_TB_HWPU * 2);
 
       // Cell content paragraphs
@@ -743,7 +747,7 @@ function convertTable(table: HTMLElement): string {
           `      <hp:cellAddr colAddr="${colAddr}" rowAddr="${rowAddr}"/>`,
           `      <hp:cellSpan colSpan="${colspan}" rowSpan="${rowspan}"/>`,
           `      <hp:cellSz width="${cellWidthHwpu}" height="${DEFAULT_CELL_HEIGHT_HWPU}"/>`,
-          `      <hp:cellMargin left="${CELL_MARGIN_LR_HWPU}" right="${CELL_MARGIN_LR_HWPU}" top="${CELL_MARGIN_TB_HWPU}" bottom="${CELL_MARGIN_TB_HWPU}"/>`,
+          `      <hp:cellMargin left="${cellMarginLR}" right="${cellMarginLR}" top="${CELL_MARGIN_TB_HWPU}" bottom="${CELL_MARGIN_TB_HWPU}"/>`,
           `      <hp:subList textDirection="LTRB" lineWrap="Break" vertAlign="Center" linkListIDRef="0" linkListNextIDRef="0" textWidth="${textWidthHwpu}" textHeight="${textHeightHwpu}">`,
           cellParts.join('\n'),
           `      </hp:subList>`,
@@ -761,9 +765,12 @@ function convertTable(table: HTMLElement): string {
   const tableHeight = rows.length * DEFAULT_CELL_HEIGHT_HWPU;
 
   return [
-    `<hp:tbl style="0" id="0" zOrder="0" lock="false" instantiate="false" numberingType="None" textWrap="TopAndBottom" blockReverse="false" allowOverlap="false" holdAnchorAndSO="false">`,
+    // widthRelTo/horzRelTo/vertRelTo are required for HWP to treat the table as a
+    // block-level element. Without them HWP floats the table and text flows beside it.
+    `<hp:tbl style="0" id="0" zOrder="0" lock="false" instantiate="false" numberingType="None" textWrap="TopAndBottom" blockReverse="false" allowOverlap="false" holdAnchorAndSO="false" widthRelTo="Para" horzRelTo="Para" vertRelTo="Para">`,
     `  <hp:sz width="${tableWidthHwpu}" widthRelTo="Fixed" height="${tableHeight}" heightRelTo="Fixed" protect="false"/>`,
-    `  <hp:pos left="0" top="0"/>`,
+    // leftRelTo/topRelTo/vertAlign/horzAlign anchor the table to the paragraph flow.
+    `  <hp:pos left="0" top="0" leftRelTo="Para" topRelTo="Para" vertAlign="Top" horzAlign="Left"/>`,
     `  <hp:outerMargin left="0" right="0" top="0" bottom="0"/>`,
     ...trXml,
     `</hp:tbl>`,
