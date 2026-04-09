@@ -523,6 +523,7 @@ function isParagraphTag(name: string): boolean {
 // ──────────────────────────────────────────────
 
 function htmlToHwpxSection(html: string): string {
+  _sectionObjectIdCounter = 0; // reset per section
   const div = document.createElement('div');
   div.innerHTML = html;
 
@@ -689,6 +690,11 @@ const DEFAULT_CELL_HEIGHT_HWPU = 850;   // ≈8.5mm row height
 // Fixed 510 HWPU (5.1mm) consumed 51% of a 2000 HWPU narrow cell, causing wrapping.
 const CELL_MARGIN_TB_HWPU = 141;        // ≈1.4mm top/bottom cell padding
 
+// Per-section object ID counter — reset at start of each section generation.
+// Each inline object (table, image, etc.) must have a unique ID within the section.
+let _sectionObjectIdCounter = 0;
+function nextSectionObjectId(): number { return ++_sectionObjectIdCounter; }
+
 function convertTable(table: HTMLElement): string {
   const rows = table.querySelectorAll('tr');
   if (rows.length === 0) return '';
@@ -767,7 +773,7 @@ function convertTable(table: HTMLElement): string {
 
       tcXml.push(
         [
-          `    <hp:tc name="" header="false" hasMargin="false" protect="false" editable="false" lineWrap="true" borderFill="0">`,
+          `    <hp:tc name="" header="false" hasMargin="false" protect="false" editable="true" lineWrap="true" borderFill="0">`,
           `      <hp:cellAddr colAddr="${colAddr}" rowAddr="${rowAddr}"/>`,
           `      <hp:cellSpan colSpan="${colspan}" rowSpan="${rowspan}"/>`,
           `      <hp:cellSz width="${cellWidthHwpu}" height="${DEFAULT_CELL_HEIGHT_HWPU}"/>`,
@@ -787,11 +793,12 @@ function convertTable(table: HTMLElement): string {
   }
 
   const tableHeight = rows.length * DEFAULT_CELL_HEIGHT_HWPU;
+  const tblId = nextSectionObjectId();
 
   return [
     // widthRelTo/horzRelTo/vertRelTo are required for HWP to treat the table as a
     // block-level element. Without them HWP floats the table and text flows beside it.
-    `<hp:tbl style="0" id="0" zOrder="0" lock="false" instantiate="false" numberingType="None" textWrap="TopAndBottom" blockReverse="false" allowOverlap="false" holdAnchorAndSO="false" widthRelTo="Para" horzRelTo="Para" vertRelTo="Para">`,
+    `<hp:tbl style="0" id="${tblId}" zOrder="${tblId}" lock="false" instantiate="false" numberingType="None" textWrap="TopAndBottom" blockReverse="false" allowOverlap="false" holdAnchorAndSO="false" widthRelTo="Para" horzRelTo="Para" vertRelTo="Para">`,
     `  <hp:sz width="${tableWidthHwpu}" widthRelTo="Fixed" height="${tableHeight}" heightRelTo="Fixed" protect="false"/>`,
     // leftRelTo/topRelTo/vertAlign/horzAlign anchor the table to the paragraph flow.
     `  <hp:pos left="0" top="0" leftRelTo="Para" topRelTo="Para" vertAlign="Top" horzAlign="Left"/>`,
@@ -942,6 +949,7 @@ function odtLengthToPt(value: string): number {
  * @param editedHtml  TipTap innerHTML — provides user-edited text in document order
  */
 function odtToHwpxSection(contentXml: string, stylesXml: string, editedHtml: string): string {
+  _sectionObjectIdCounter = 0; // reset per section
   const domParser = new DOMParser();
   const contentDoc = domParser.parseFromString(contentXml, 'application/xml');
   const stylesDoc = stylesXml
@@ -1116,7 +1124,7 @@ function odtTableNodeToHwpx(
         }
 
         tcXml.push([
-          `    <hp:tc name="" header="false" hasMargin="false" protect="false" editable="false" lineWrap="true" borderFill="0">`,
+          `    <hp:tc name="" header="false" hasMargin="false" protect="false" editable="true" lineWrap="true" borderFill="0">`,
           `      <hp:cellAddr colAddr="${effectiveColAddr}" rowAddr="${rowAddr}"/>`,
           `      <hp:cellSpan colSpan="${colspan}" rowSpan="${rowspan}"/>`,
           `      <hp:cellSz width="${cellWidthHwpu}" height="${DEFAULT_CELL_HEIGHT_HWPU}"/>`,
@@ -1140,9 +1148,10 @@ function odtTableNodeToHwpx(
   if (trXml.length === 0) return '';
 
   const tableHeight = rows.length * DEFAULT_CELL_HEIGHT_HWPU;
+  const tblId = nextSectionObjectId();
 
   return [
-    `<hp:tbl style="0" id="0" zOrder="0" lock="false" instantiate="false" numberingType="None" textWrap="TopAndBottom" blockReverse="false" allowOverlap="false" holdAnchorAndSO="false" widthRelTo="Para" horzRelTo="Para" vertRelTo="Para">`,
+    `<hp:tbl style="0" id="${tblId}" zOrder="${tblId}" lock="false" instantiate="false" numberingType="None" textWrap="TopAndBottom" blockReverse="false" allowOverlap="false" holdAnchorAndSO="false" widthRelTo="Para" horzRelTo="Para" vertRelTo="Para">`,
     `  <hp:sz width="${tableWidthHwpu}" widthRelTo="Fixed" height="${tableHeight}" heightRelTo="Fixed" protect="false"/>`,
     `  <hp:pos left="0" top="0" leftRelTo="Para" topRelTo="Para" vertAlign="Top" horzAlign="Left"/>`,
     `  <hp:outerMargin left="0" right="0" top="0" bottom="0"/>`,
