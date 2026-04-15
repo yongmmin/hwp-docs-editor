@@ -11,11 +11,11 @@ import { useSuggestionStore } from '../../stores/suggestionStore';
 import { useRefinementStore } from '../../stores/refinementStore';
 import { useOllama } from '../../hooks/useOllama';
 import { useFileUpload } from '../../hooks/useFileUpload';
-import { exportToHwpx } from '../../services/hwp/hwpxExporter';
+import { exportDocument } from '../../services/export';
 import { downloadBlob, getExportFilename } from '../../utils/file';
 
 export function AppShell() {
-  const { view, document: doc, fileName, isLoading } = useDocumentStore();
+  const { view, document: doc, fileName, isLoading, editor } = useDocumentStore();
   const { connected, models, selectedModel, selectModel, refresh } = useOllama();
   const { closePanel: closeSuggestion } = useSuggestionStore();
   const { closePanel: closeRefinement } = useRefinementStore();
@@ -54,20 +54,17 @@ export function AppShell() {
   }, [closeSuggestion, closeRefinement]);
 
   const handleExport = useCallback(async () => {
-    if (doc?.sourceMode === 'hwp-original-readonly') return;
-    const editorEl = document.querySelector('.tiptap');
-    if (!editorEl) return;
+    if (!doc || !editor) return;
+    if (doc.sourceMode === 'hwp-original-readonly') return;
 
-    const html = editorEl.innerHTML;
-    const blob = await exportToHwpx(
-      html,
-      doc?.rawZipData,
-      doc?.hwpxExportContext,
-      doc?.rawOdtContentXml,
-      doc?.rawOdtStylesXml,
-    );
-    downloadBlob(blob, getExportFilename(fileName));
-  }, [doc, fileName]);
+    try {
+      const { blob, format } = await exportDocument(editor, doc);
+      downloadBlob(blob, getExportFilename(fileName, format));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      window.alert(`내보내기에 실패했습니다.\n${message}`);
+    }
+  }, [doc, editor, fileName]);
 
   if (view === 'upload') {
     return (

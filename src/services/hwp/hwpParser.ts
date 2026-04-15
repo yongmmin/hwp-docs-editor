@@ -69,8 +69,7 @@ async function parseHwp(buffer: ArrayBuffer, filename: string): Promise<ParsedDo
       originalViewHtml: originalViewHtml ?? undefined,
       sourceMode: 'editable',
       originalFormat: 'hwp',
-      rawOdtContentXml: odtResult.contentXml,
-      rawOdtStylesXml: odtResult.stylesXml,
+      rawHwpBuffer: buffer,             // preserved for in-place export
     };
   }
 
@@ -82,10 +81,16 @@ async function parseHwp(buffer: ArrayBuffer, filename: string): Promise<ParsedDo
       originalViewHtml,
       sourceMode: 'hwp-original-readonly',
       originalFormat: 'hwp',
+      rawHwpBuffer: buffer,
     };
   }
 
-  return { ...legacyResult, sourceMode: 'editable', originalFormat: 'hwp' };
+  return {
+    ...legacyResult,
+    sourceMode: 'editable',
+    originalFormat: 'hwp',
+    rawHwpBuffer: buffer,
+  };
 }
 
 // ─── Bridge: ODT extraction ────────────────────────────────────────────────────

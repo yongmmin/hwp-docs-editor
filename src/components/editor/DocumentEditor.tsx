@@ -25,7 +25,7 @@ interface DocumentEditorProps {
 }
 
 export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorProps) {
-  const { document: doc } = useDocumentStore();
+  const { document: doc, setEditor } = useDocumentStore();
   const readonlyHwp = doc?.sourceMode === 'hwp-original-readonly';
   const pageStyle = buildPageStyle(doc?.pageLayout);
   const { open: openFindReplace } = useFindReplaceStore();
@@ -86,6 +86,13 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [requestSuggestions, openFindReplace]);
+
+  // Register the editor instance globally so export (triggered from Header
+  // via AppShell) can read the current document without a DOM query.
+  useEffect(() => {
+    setEditor(editor);
+    return () => setEditor(null);
+  }, [editor, setEditor]);
 
   return {
     editor,
