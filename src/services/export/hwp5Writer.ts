@@ -19,10 +19,13 @@ import type { Hwp5ExportMeta } from '../../types';
  *   6. pako.deflateRaw로 재압축 → cfb.write()로 OLE2 재직렬화
  */
 export async function writeHwp5(
-  _json: JSONContent,
-  _originalBuffer: ArrayBuffer,
-  _meta: Hwp5ExportMeta | undefined
+  json: JSONContent,
+  originalBuffer: ArrayBuffer,
+  meta: Hwp5ExportMeta | undefined
 ): Promise<Blob> {
+  void json;
+  void originalBuffer;
+  void meta;
   throw new Error(
     'HWP 내보내기는 재작성 진행 중입니다. (docs/EXPORT_REWRITE_PLAN.md)'
   );
