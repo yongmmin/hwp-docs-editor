@@ -1,8 +1,46 @@
 # 내보내기 전면 재작성 계획
 
 > 작성일: 2026-04-15
-> 상태: 계획 확정, 구현 진행 중
-> 브랜치: `feature/export-improvement`
+> 최종 수정: 2026-04-16
+> 상태: **1차 구현 완료, 실 파일 검증에서 편집 미반영 현상 확인 — 디버깅 필요**
+> 브랜치: `feature/export-improvement` → `main` 병합 완료
+
+## 현재 상태 (2026-04-16)
+
+1차 재작성이 모두 커밋되었고 기능 자체는 엔드-투-엔드로 돌아가는 상태.
+아키텍처·타입·라이터·LCS 기반 매칭·Cmd+S 저장까지 구현 완료.
+
+### 확인된 미해결 이슈
+
+**증상**: 편집기에서 기준 HWP 파일을 수정하고 Cmd+S로 저장한 뒤 내보내기를 실행해도,
+다운로드된 파일이 원본과 동일하다 (편집이 반영되지 않음).
+
+**의심 가는 원인 (우선순위 순)**:
+1. HWP 파싱 경로가 pyhwp ODT 브리지를 통과하므로, 편집기가 보는 TipTap 단락과
+   `hwp5ExportMeta`가 제공하는 HWP5 단락의 텍스트가 LCS에서 **하나도 매칭되지 않을**
+   가능성 — 공백/문단 기호/한자 처리가 두 파이프라인에서 다르게 정규화될 수 있음.
+   `normalizeForMatch`가 충분히 공격적인지 재검토 필요.
+2. ODT 파이프라인이 단락을 쪼개거나 합치는 방식이 HWP5 레코드 경계와 다르면,
+   LCS 앵커가 거의 잡히지 않고 모든 단락이 unmatched-pair 상태가 되어버림.
+   이 경우 갭 내부에서 1:1 페어링이 우연히 맞으면 패치가 들어가야 하는데,
+   갭 크기 차이가 크면 pair 수가 0이 되어 패치가 사라짐.
+3. `tryPatchParagraphBlock`이 더 엄격한 조건(단일 PARA_TEXT, 제어 코드 없음)에
+   걸려서 거의 모든 단락에서 null을 반환하고 있을 가능성.
+4. 내보내기 시 최신 에디터 상태를 내보내지 못하는 경로가 남아 있을 가능성 —
+   `saveEditorSnapshot()`이 `editor.getHTML()`을 다시 `doc.html`에 쓰지만,
+   export는 `editor.getJSON()`을 읽으므로 이론상 문제는 없어야 하나 확인 필요.
+
+### 다음 디버깅 액션
+
+- [ ] 브라우저 콘솔에서 `[hwp5Writer] editor paragraphs=N, hwp paragraphs=M, patches=K` 로그 확인
+  - K=0이면 LCS 정렬 실패, K>0이지만 여전히 결과 미반영이면 `tryPatchParagraphBlock` 실패
+- [ ] HWP5 단락 `origText`와 TipTap 단락 텍스트를 샘플 출력해 두 파이프라인의 정규화 차이 파악
+- [ ] `tryPatchParagraphBlock`이 null을 반환하는 이유를 레코드 단위로 로깅
+- [ ] LCS 대신 position-biased matching(예: 인덱스 근접도 가중)으로 fallback 전략 추가 검토
+- [ ] 최악의 경우: HTML 편집 경로를 ODT 브리지에서 레거시 JS 파서로 되돌리는 옵션 검토
+  (단, 파싱 품질은 ODT 쪽이 우위이므로 최후 수단)
+
+## 배경
 
 ## 배경
 
