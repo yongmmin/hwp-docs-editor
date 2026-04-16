@@ -6,6 +6,7 @@ import {
   readRecordHeaders,
   writeRecordHeader,
   recordTotalSize,
+  collectParagraphBlocks,
   TAG_PARA_HEADER,
   TAG_PARA_TEXT,
 } from './hwp5Records';
@@ -480,4 +481,61 @@ function concatUint8(parts: Uint8Array[]): Uint8Array {
     off += p.length;
   }
   return out;
+}
+
+// ─── Meta re-collection (for save-to-buffer) ───────────────────────────────
+
+/**
+ * Re-collect HWP5 export metadata from a (possibly already-patched) buffer.
+ * Used after an in-place save so that byte offsets and origTexts stay in sync
+ * with the updated binary.
+ */
+export function recollectHwp5Meta(buffer: ArrayBuffer): Hwp5ExportMeta {
+  const cfbContainer = CFB.read(new Uint8Array(buffer), { type: 'array' });
+  const compressed = isHwpCompressed(cfbContainer);
+  const sections: Hwp5ExportMeta['sections'] = [];
+
+  for (let s = 0; s < 256; s += 1) {
+    const rawStream = getStreamBytes(cfbContainer, `/BodyText/Section${s}`);
+    if (!rawStream) break;
+    const data = compressed ? pako.inflateRaw(rawStream) : rawStream;
+    const headers = readRecordHeaders(data);
+    const blocks = collectParagraphBlocks(headers, data.length);
+    sections.push({
+      streamPath: `/BodyText/Section${s}`,
+      paragraphs: blocks.map((b) => ({
+        startOffset: b.startOffset,
+        endOffset: b.endOffset,
+        hasControls: b.hasControls,
+        origText: extractBlockText(data, headers, b.startOffset, b.endOffset),
+      })),
+    });
+  }
+
+  return { sections };
+}
+
+/**
+ * Decode plaintext from all level-1 PARA_TEXT records within a paragraph block.
+ * Skips HWP5 inline control codes (< 0x20 except TAB/LF/CR).
+ */
+function extractBlockText(
+  data: Uint8Array,
+  headers: ReturnType<typeof readRecordHeaders>,
+  startOffset: number,
+  endOffset: number
+): string {
+  let out = '';
+  for (const rec of headers) {
+    if (rec.headerOffset < startOffset) continue;
+    if (rec.headerOffset >= endOffset) break;
+    if (rec.tagId !== TAG_PARA_TEXT || rec.level !== 1) continue;
+    const bytes = data.subarray(rec.dataOffset, rec.dataOffset + rec.size);
+    for (let i = 0; i + 1 < bytes.length; i += 2) {
+      const code = bytes[i] | (bytes[i + 1] << 8);
+      if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) continue;
+      out += String.fromCharCode(code);
+    }
+  }
+  return out.endsWith('\n') ? out.slice(0, -1) : out;
 }

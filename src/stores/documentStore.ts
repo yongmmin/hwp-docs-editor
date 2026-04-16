@@ -17,8 +17,8 @@ interface DocumentState {
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
   setEditor: (editor: Editor | null) => void;
-  /** Snapshot the current editor HTML into document.html (Cmd+S). */
-  saveEditorSnapshot: () => boolean;
+  /** Merge partial updates into the current document (e.g. after save). */
+  updateDocument: (fields: Partial<ParsedDocument>) => void;
   reset: () => void;
 }
 
@@ -43,12 +43,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   setLoading: (isLoading) => set({ isLoading }),
   setError: (error) => set({ error }),
   setEditor: (editor) => set({ editor }),
-  saveEditorSnapshot: () => {
-    const { editor, document } = get();
-    if (!editor || !document) return false;
-    const html = editor.getHTML();
-    set({ document: { ...document, html } });
-    return true;
+  updateDocument: (fields) => {
+    const { document } = get();
+    if (!document) return;
+    set({ document: { ...document, ...fields } });
   },
   reset: () =>
     set({

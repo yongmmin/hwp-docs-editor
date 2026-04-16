@@ -17,6 +17,7 @@ import { useDocumentStore } from '../../stores/documentStore';
 import { useWordSuggestion } from '../../hooks/useWordSuggestion';
 import { useTextRefinement } from '../../hooks/useTextRefinement';
 import { useFindReplaceStore } from '../../stores/findReplaceStore';
+import { saveDocumentInPlace } from '../../services/export';
 import type { PageLayout } from '../../types';
 
 interface DocumentEditorProps {
@@ -25,12 +26,13 @@ interface DocumentEditorProps {
 }
 
 export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorProps) {
-  const { document: doc, setEditor, saveEditorSnapshot } = useDocumentStore();
+  const { document: doc, setEditor } = useDocumentStore();
   const readonlyHwp = doc?.sourceMode === 'hwp-original-readonly';
   const pageStyle = buildPageStyle(doc?.pageLayout);
   const { open: openFindReplace } = useFindReplaceStore();
   const loadedDocRef = useRef<typeof doc>(null);
   const [saveFlash, setSaveFlash] = useState(false);
+  const savingRef = useRef(false);
 
   const editor = useEditor({
     extensions: [
@@ -63,12 +65,17 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
   const { requestSuggestions, applySuggestion } = useWordSuggestion(editor, ollamaModel);
   const { requestRefinement, applyRefinement } = useTextRefinement(editor, ollamaModel);
 
-  // Load the document into the editor only when a *new* document arrives.
-  // We intentionally depend on `doc` identity (not `doc.html`) so Cmd+S —
-  // which snapshots editor HTML back into the store — does not clobber the
-  // live editor state mid-edit.
+  // Load the document into the editor only on initial mount or when a truly
+  // new file is opened (not when save updates the store's doc reference).
   useEffect(() => {
     if (!editor || !doc || readonlyHwp) return;
+    // After save, we update the store's document (new reference) but the
+    // editor already has the correct content. Skip the reset.
+    if (savingRef.current) {
+      savingRef.current = false;
+      loadedDocRef.current = doc;
+      return;
+    }
     if (loadedDocRef.current === doc) return;
     editor.commands.setContent(doc.html || '');
     loadedDocRef.current = doc;
@@ -88,20 +95,32 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
         e.preventDefault();
         openFindReplace('replace');
       }
-      // Cmd+S / Ctrl+S — snapshot current editor HTML into the document
-      // so subsequent exports operate on the saved state.
+      // Cmd+S / Ctrl+S — save edits into the document's in-memory binary
+      // buffer so the "loaded file" reflects changes, not just exports.
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key === 's') {
         e.preventDefault();
-        if (saveEditorSnapshot()) {
-          setSaveFlash(true);
-          window.setTimeout(() => setSaveFlash(false), 1200);
-        }
+        const currentEditor = useDocumentStore.getState().editor;
+        const currentDoc = useDocumentStore.getState().document;
+        if (!currentEditor || !currentDoc || savingRef.current) return;
+        savingRef.current = true;
+        setSaveFlash(true);
+        saveDocumentInPlace(currentEditor, currentDoc)
+          .then((fields) => {
+            useDocumentStore.getState().updateDocument(fields);
+          })
+          .catch((err) => {
+            console.warn('[save] 저장 실패:', err);
+            savingRef.current = false;
+          })
+          .finally(() => {
+            window.setTimeout(() => setSaveFlash(false), 1200);
+          });
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [requestSuggestions, openFindReplace, saveEditorSnapshot]);
+  }, [requestSuggestions, openFindReplace]);
 
   // Register the editor instance globally so export (triggered from Header
   // via AppShell) can read the current document without a DOM query.

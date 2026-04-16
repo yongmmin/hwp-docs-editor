@@ -293,3 +293,39 @@ function extractXmlDeclaration(xml: string): string {
   const match = xml.match(/^\s*<\?xml[^?]*\?>\s*/);
   return match ? match[0] : '';
 }
+
+// ─── Meta re-collection (for save-to-buffer) ───────────────────────────────
+
+/**
+ * Re-collect HWPX export metadata from a (possibly already-patched) zip buffer.
+ * Mirrors the metadata collection in hwpxParser.ts but without generating HTML.
+ */
+export async function recollectHwpxMeta(zipData: ArrayBuffer): Promise<HwpxExportMeta> {
+  const zip = await JSZip.loadAsync(zipData);
+
+  // Discover section XML paths from zip entries.
+  const sectionPaths: string[] = [];
+  zip.forEach((path) => {
+    if (/Contents\/sec(?:tion)?\d+\.xml$/i.test(path)) {
+      sectionPaths.push(path);
+    }
+  });
+  sectionPaths.sort();
+
+  const paragraphs: HwpxExportMeta['paragraphs'] = [];
+
+  for (const sectionPath of sectionPaths) {
+    const file = zip.file(sectionPath);
+    if (!file) continue;
+    const xml = await file.async('string');
+    const tree = xmlParser.parse(xml) as OrderedNodes;
+    const nodes = collectParagraphNodes(tree);
+
+    nodes.forEach((_node, idx) => {
+      const id = `${sectionPath}_p${idx}`;
+      paragraphs.push({ id, sectionPath, region: 'body', orderInSection: idx });
+    });
+  }
+
+  return { sectionPaths, paragraphs };
+}
