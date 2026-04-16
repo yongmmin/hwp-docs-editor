@@ -1,13 +1,18 @@
 import CFB from 'cfb';
 import pako from 'pako';
-import type { PageLayout, ParsedDocument } from '../../types';
+import type { Hwp5ExportMeta, PageLayout, ParsedDocument } from '../../types';
+import {
+  collectParagraphBlocks,
+  readRecordHeaders,
+  TAG_PARA_HEADER,
+} from '../export/hwp5Records';
 
-// ─── HWP 태그 ID ───
+// ─── HWP 태그 ID — shared with src/services/export/hwp5Records.ts ───
+// TAG_PARA_HEADER is imported from hwp5Records; the rest remain local.
 const TAG_CHAR_SHAPE = 21;
 const TAG_BORDER_FILL = 20;
 const TAG_FACE_NAME = 19;
 const TAG_PARA_SHAPE = 25;
-const TAG_PARA_HEADER = 66;
 const TAG_PARA_TEXT = 67;
 const TAG_PARA_CHAR_SHAPE = 68;
 const TAG_CTRL_HEADER = 71;
@@ -110,6 +115,7 @@ export async function parseHwpLegacy(buffer: ArrayBuffer): Promise<ParsedDocumen
       pageLayout: rendered.pageLayout,
       metadata,
       originalFormat: 'hwp',
+      hwp5ExportMeta: rendered.exportMeta,
     };
   } catch (e) {
     console.error('HWP 파싱 오류:', e);
@@ -455,9 +461,10 @@ function renderAllSections(
   cfb: CFB.CFB$Container,
   comp: boolean,
   ctx: Ctx
-): { html: string; pageLayout?: PageLayout } {
+): { html: string; pageLayout?: PageLayout; exportMeta: Hwp5ExportMeta } {
   const parts: string[] = [];
   let pageLayout: PageLayout | undefined;
+  const exportSections: Hwp5ExportMeta['sections'] = [];
   for (let s = 0; s < 256; s++) {
     const data = getStream(cfb, `/BodyText/Section${s}`, comp);
     if (!data) break;
@@ -467,9 +474,79 @@ function renderAllSections(
     // 섹션 간 페이지 분리 삽입 (첫 섹션 제외)
     if (parts.length > 0) parts.push('<hr class="hwp-page-break" />');
     parts.push(renderSection(recs, ctx, sectionPageLayout ?? pageLayout));
+
+    // Collect per-section paragraph byte ranges for in-place export.
+    // We re-walk the stream via the shared record header scanner so the
+    // offsets come from the exact same bytes the writer will patch later.
+    const headers = readRecordHeaders(data);
+    const blocks = collectParagraphBlocks(headers, data.length);
+    exportSections.push({
+      streamPath: `/BodyText/Section${s}`,
+      paragraphs: blocks.map((b) => ({
+        startOffset: b.startOffset,
+        endOffset: b.endOffset,
+        hasControls: b.hasControls,
+        origText: extractBlockOrigText(data, headers, b),
+      })),
+    });
   }
-  return { html: parts.join(''), pageLayout };
+  return {
+    html: parts.join(''),
+    pageLayout,
+    exportMeta: { sections: exportSections },
+  };
 }
+
+/**
+ * Decode the plaintext contained in a paragraph block by concatenating every
+ * level-1 PARA_TEXT record inside [block.startOffset, block.endOffset).
+ *
+ * Used by the HWP5 export writer for text-based matching between TipTap
+ * paragraphs and the original HWP5 structure when paragraph counts disagree
+ * (which is the norm when the edit HTML came from the pyhwp ODT bridge).
+ */
+function extractBlockOrigText(
+  data: Uint8Array,
+  headers: ReturnType<typeof readRecordHeaders>,
+  block: { startOffset: number; endOffset: number },
+): string {
+  let out = '';
+  for (const rec of headers) {
+    if (rec.headerOffset < block.startOffset) continue;
+    if (rec.headerOffset >= block.endOffset) break;
+    if (rec.tagId !== TAG_PARA_TEXT || rec.level !== 1) continue;
+    const bytes = data.subarray(rec.dataOffset, rec.dataOffset + rec.size);
+    out += decodeHwpParaText(bytes);
+  }
+  // HWP5 paragraphs typically end with a trailing newline; strip for matching.
+  return out.endsWith('\n') ? out.slice(0, -1) : out;
+}
+
+/**
+ * Decode a PARA_TEXT payload (UTF-16LE) while skipping the inline control
+ * markers HWP5 embeds (codes < 0x20 except TAB/LF/CR). Returns plain text
+ * suitable for comparison with editor-produced paragraph text.
+ */
+function decodeHwpParaText(bytes: Uint8Array): string {
+  // Filter out control codes so comparison is stable.
+  const chars: number[] = [];
+  for (let i = 0; i + 1 < bytes.length; i += 2) {
+    const code = bytes[i] | (bytes[i + 1] << 8);
+    if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) continue;
+    chars.push(code);
+  }
+  try {
+    const buf = new Uint8Array(chars.length * 2);
+    for (let i = 0; i < chars.length; i += 1) {
+      buf[i * 2] = chars[i] & 0xff;
+      buf[i * 2 + 1] = (chars[i] >>> 8) & 0xff;
+    }
+    return UTF16LE_DECODER.decode(buf);
+  } catch {
+    return String.fromCharCode(...chars);
+  }
+}
+
 
 function renderSection(recs: Rec[], ctx: Ctx, pageLayout?: PageLayout): string {
   const out: string[] = [];

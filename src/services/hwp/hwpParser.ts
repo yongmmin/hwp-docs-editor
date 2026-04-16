@@ -62,13 +62,14 @@ async function parseHwp(buffer: ArrayBuffer, filename: string): Promise<ParsedDo
   ]);
 
   if (odtResult) {
-    const enhancedHtml = tryInjectLegacyColWidths(odtResult, legacyResult?.html);
+    const enhancedHtml = tryInjectLegacyColWidths(odtResult.html, legacyResult?.html);
     return {
-      ...legacyResult,                  // metadata, pageLayout from JS parser
+      ...legacyResult,                  // metadata, pageLayout, hwp5ExportMeta from JS parser
       html: enhancedHtml,               // high-quality editable HTML from ODT (+ injected col widths)
       originalViewHtml: originalViewHtml ?? undefined,
       sourceMode: 'editable',
       originalFormat: 'hwp',
+      rawHwpBuffer: buffer,             // preserved for in-place export
     };
   }
 
@@ -80,10 +81,16 @@ async function parseHwp(buffer: ArrayBuffer, filename: string): Promise<ParsedDo
       originalViewHtml,
       sourceMode: 'hwp-original-readonly',
       originalFormat: 'hwp',
+      rawHwpBuffer: buffer,
     };
   }
 
-  return { ...legacyResult, sourceMode: 'editable', originalFormat: 'hwp' };
+  return {
+    ...legacyResult,
+    sourceMode: 'editable',
+    originalFormat: 'hwp',
+    rawHwpBuffer: buffer,
+  };
 }
 
 // ─── Bridge: ODT extraction ────────────────────────────────────────────────────
@@ -94,7 +101,13 @@ interface OdtExtractResult {
   images: Record<string, string>;
 }
 
-async function tryExtractOdt(base64: string, filename: string): Promise<string | undefined> {
+interface OdtExtractSuccess {
+  html: string;
+  contentXml: string;
+  stylesXml: string;
+}
+
+async function tryExtractOdt(base64: string, filename: string): Promise<OdtExtractSuccess | undefined> {
   const bridgeUrl = 'http://127.0.0.1:3210/extract-hwp';
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 60_000);
@@ -113,7 +126,9 @@ async function tryExtractOdt(base64: string, filename: string): Promise<string |
     if (!data?.contentXml || typeof data.contentXml !== 'string') return undefined;
 
     const html = odtContentToHtml(data.contentXml, data.stylesXml ?? '', data.images ?? {});
-    return html || undefined;
+    if (!html) return undefined;
+
+    return { html, contentXml: data.contentXml, stylesXml: data.stylesXml ?? '' };
   } catch {
     return undefined;
   } finally {

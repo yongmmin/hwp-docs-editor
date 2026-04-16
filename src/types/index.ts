@@ -9,16 +9,45 @@ export interface PageLayout {
   footerPaddingPt?: number;
 }
 
-export interface HwpxExportPlanEntry {
-  path: string;
-  region: 'body' | 'header' | 'footer';
-  paragraphCount: number;
-  textSignature?: string;
-  paragraphIds?: string[];
+/**
+ * Metadata collected by the HWPX parser to enable in-place export.
+ * Each paragraph ID maps back to a (sectionPath, byte range) in the
+ * original zip's section XML so the writer can replace only the
+ * `<hp:p>` block without rebuilding the document.
+ */
+export interface HwpxExportMeta {
+  /** Ordered list of section XML paths inside the zip (body, header, footer) */
+  sectionPaths: string[];
+  /** paragraph id → { sectionPath, paragraph order index in that section } */
+  paragraphs: Array<{
+    id: string;
+    sectionPath: string;
+    region: 'body' | 'header' | 'footer';
+    orderInSection: number;
+  }>;
 }
 
-export interface HwpxExportContext {
-  entries: HwpxExportPlanEntry[];
+/**
+ * Metadata collected by the HWP5 legacy parser to enable in-place export.
+ * Each paragraph maps to a byte range inside a decompressed BodyText
+ * section stream so the writer can patch records without rebuilding.
+ */
+export interface Hwp5ExportMeta {
+  /** Per-section streams (e.g. "BodyText/Section0"), in order */
+  sections: Array<{
+    streamPath: string;
+    /** Ordered paragraph byte ranges inside the decompressed stream */
+    paragraphs: Array<{
+      /** Byte offset of the HWPTAG_PARA_HEADER record, inclusive */
+      startOffset: number;
+      /** Byte offset just past the final record for this paragraph */
+      endOffset: number;
+      /** True if this paragraph contains control records (table/image/etc.) */
+      hasControls: boolean;
+      /** Decoded plaintext of the PARA_TEXT record (for text-based matching). */
+      origText: string;
+    }>;
+  }>;
 }
 
 export interface ParsedDocument {
@@ -30,10 +59,14 @@ export interface ParsedDocument {
   pageLayout?: PageLayout;
   metadata: DocumentMetadata;
   originalFormat: 'hwp' | 'hwpx';
-  /** Raw HWPX zip data for re-export (preserves structure) */
+  /** Raw HWPX zip data for in-place export */
   rawZipData?: ArrayBuffer;
-  /** Parser-derived path/order metadata for structure-preserving HWPX export */
-  hwpxExportContext?: HwpxExportContext;
+  /** HWPX parser-derived metadata for in-place export */
+  hwpxExportMeta?: HwpxExportMeta;
+  /** Raw HWP5 binary buffer for in-place export */
+  rawHwpBuffer?: ArrayBuffer;
+  /** HWP5 parser-derived metadata for in-place export */
+  hwp5ExportMeta?: Hwp5ExportMeta;
 }
 
 export interface DocumentMetadata {

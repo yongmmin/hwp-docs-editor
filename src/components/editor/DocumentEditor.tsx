@@ -1,4 +1,4 @@
-import { useEffect, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Underline from '@tiptap/extension-underline';
@@ -25,10 +25,12 @@ interface DocumentEditorProps {
 }
 
 export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorProps) {
-  const { document: doc } = useDocumentStore();
+  const { document: doc, setEditor, saveEditorSnapshot } = useDocumentStore();
   const readonlyHwp = doc?.sourceMode === 'hwp-original-readonly';
   const pageStyle = buildPageStyle(doc?.pageLayout);
   const { open: openFindReplace } = useFindReplaceStore();
+  const loadedDocRef = useRef<typeof doc>(null);
+  const [saveFlash, setSaveFlash] = useState(false);
 
   const editor = useEditor({
     extensions: [
@@ -61,11 +63,16 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
   const { requestSuggestions, applySuggestion } = useWordSuggestion(editor, ollamaModel);
   const { requestRefinement, applyRefinement } = useTextRefinement(editor, ollamaModel);
 
+  // Load the document into the editor only when a *new* document arrives.
+  // We intentionally depend on `doc` identity (not `doc.html`) so Cmd+S —
+  // which snapshots editor HTML back into the store — does not clobber the
+  // live editor state mid-edit.
   useEffect(() => {
-    if (editor && doc?.html && !readonlyHwp) {
-      editor.commands.setContent(doc.html);
-    }
-  }, [editor, doc?.html, readonlyHwp]);
+    if (!editor || !doc || readonlyHwp) return;
+    if (loadedDocRef.current === doc) return;
+    editor.commands.setContent(doc.html || '');
+    loadedDocRef.current = doc;
+  }, [editor, doc, readonlyHwp]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -81,11 +88,27 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
         e.preventDefault();
         openFindReplace('replace');
       }
+      // Cmd+S / Ctrl+S — snapshot current editor HTML into the document
+      // so subsequent exports operate on the saved state.
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key === 's') {
+        e.preventDefault();
+        if (saveEditorSnapshot()) {
+          setSaveFlash(true);
+          window.setTimeout(() => setSaveFlash(false), 1200);
+        }
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [requestSuggestions, openFindReplace]);
+  }, [requestSuggestions, openFindReplace, saveEditorSnapshot]);
+
+  // Register the editor instance globally so export (triggered from Header
+  // via AppShell) can read the current document without a DOM query.
+  useEffect(() => {
+    setEditor(editor);
+    return () => setEditor(null);
+  }, [editor, setEditor]);
 
   return {
     editor,
@@ -118,6 +141,11 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
                 <EditorContent editor={editor} />
               </div>
             </div>
+            {saveFlash && (
+              <div className="pointer-events-none fixed bottom-6 right-6 z-50 rounded-md bg-black/80 px-3 py-2 text-sm text-white shadow-lg">
+                저장됨
+              </div>
+            )}
           </>
         )}
       </div>

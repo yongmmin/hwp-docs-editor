@@ -11,9 +11,11 @@ import { useSuggestionStore } from '../../stores/suggestionStore';
 import { useRefinementStore } from '../../stores/refinementStore';
 import { useOllama } from '../../hooks/useOllama';
 import { useFileUpload } from '../../hooks/useFileUpload';
+import { exportDocument } from '../../services/export';
+import { downloadBlob, getExportFilename } from '../../utils/file';
 
 export function AppShell() {
-  const { view, document: doc, fileName, isLoading } = useDocumentStore();
+  const { view, document: doc, fileName, isLoading, editor, saveEditorSnapshot } = useDocumentStore();
   const { connected, models, selectedModel, selectModel, refresh } = useOllama();
   const { closePanel: closeSuggestion } = useSuggestionStore();
   const { closePanel: closeRefinement } = useRefinementStore();
@@ -51,6 +53,26 @@ export function AppShell() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [closeSuggestion, closeRefinement]);
 
+  const handleExport = useCallback(async () => {
+    if (!doc || !editor) return;
+    if (doc.sourceMode === 'hwp-original-readonly') return;
+
+    // Ensure the latest editor state is snapshotted into the document before
+    // export, so the download reflects every unsaved keystroke.
+    saveEditorSnapshot();
+    // Re-read doc from the store after the snapshot so meta + raw buffers
+    // travel with the freshly-saved HTML.
+    const latestDoc = useDocumentStore.getState().document ?? doc;
+
+    try {
+      const { blob, format } = await exportDocument(editor, latestDoc);
+      downloadBlob(blob, getExportFilename(fileName, format));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      window.alert(`내보내기에 실패했습니다.\n${message}`);
+    }
+  }, [doc, editor, fileName, saveEditorSnapshot]);
+
   if (view === 'upload') {
     return (
       <div className="h-screen flex flex-col bg-[#e8e8e8]">
@@ -60,6 +82,7 @@ export function AppShell() {
           selectedModel={selectedModel}
           onSelectModel={selectModel}
           onRefreshModels={refresh}
+          onExport={handleExport}
         />
         <main className="flex-1 flex items-center justify-center">
           <FileUploader />
@@ -77,6 +100,8 @@ export function AppShell() {
         selectedModel={selectedModel}
         onSelectModel={selectModel}
         onRefreshModels={refresh}
+        onExport={handleExport}
+        exportDisabled={doc?.sourceMode === 'hwp-original-readonly'}
       />
       <div className="flex-1 flex overflow-hidden relative">
         <EditorArea

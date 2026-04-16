@@ -9,9 +9,12 @@ export function downloadBlob(blob: Blob, filename: string): void {
   URL.revokeObjectURL(url);
 }
 
-export function getExportFilename(originalFilename: string | null): string {
-  if (!originalFilename) return 'document.hwpx';
+export function getExportFilename(
+  originalFilename: string | null,
+  format: 'hwp' | 'hwpx'
+): string {
+  if (!originalFilename) return `document.${format}`;
 
   const base = originalFilename.replace(/\.(hwp|hwpx)$/i, '');
-  return `${base}_편집됨.hwpx`;
+  return `${base}_편집됨.${format}`;
 }

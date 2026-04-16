@@ -446,34 +446,134 @@ StarterKit 설정: `StarterKit.configure({ paragraph: false })` + 커스텀 `Par
 
 ### 전략
 
-| 원본 포맷 | 내보내기 방식 |
-|-----------|-------------|
-| HWPX | 원본 ZIP 구조 유지 → 섹션/머리글/바닥글 XML의 문단 텍스트만 순서대로 패치 |
-| HWP | 최소 HWPX 구조 신규 생성 |
+| 원본 포맷 | 내보내기 방식 | 표 보존 여부 |
+|-----------|-------------|------------|
+| HWPX | 원본 ZIP 구조 유지 → 문단 텍스트만 ID 기반 패치 | ✅ 원본 구조 그대로 |
+| HWP | 최소 HWPX 구조 신규 생성 (`exportMinimalHwpx`) | ⚠️ 미완 (텍스트만 출력) |
 
 ### HWPX 원본 보존형 내보내기
 
-`rawZipData`가 있으면 에디터 HTML을 그대로 새 HWPX로 재생성하지 않는다.
-대신 원본 HWPX 패키지를 다시 열고:
+`rawZipData`가 있으면 에디터 HTML을 새로 재생성하지 않는다.  
+원본 HWPX 패키지를 열고, 텍스트 노드만 외과적으로 교체한다.
 
-1. `content.hpf`에서 본문 섹션 / 머리글 / 바닥글 XML 경로를 수집
-2. 에디터 HTML에서 body / header / footer 영역별 문단 텍스트를 추출
-3. 각 XML 파일을 `fast-xml-parser(preserveOrder)`로 파싱
-4. 원본 XML의 문단(`hp:p`/`para`)을 순서대로 순회하면서 텍스트 노드만 교체
-5. 수정된 XML만 ZIP에 다시 넣어 `.hwpx`로 다운로드
-6. 파서가 저장한 파일별 문단 signature와 비교해 변경 없는 XML은 export 시 재파싱을 건너뜀
+#### 파이프라인
 
-이 방식의 목적은 다음과 같다.
+```
+editor innerHTML
+  → extractParagraphTextById()      # data-hwp-para-id ↦ 현재 텍스트 맵
+  → getEntryValues()
+      - 파서가 저장한 paragraphIds 순서로 맵 조회
+      - 없는 ID(삭제된 문단)는 '' 처리
+  → computeParagraphSignature()     # 변경 없는 파일 skip
+  → patchXmlParagraphValues()
+      - fast-xml-parser(preserveOrder) 파싱
+      - collectParagraphNodes() — hp:p / hp:para 재귀 수집
+      - 빈 단락 skip (원본에 텍스트 없는 행간 문단은 인덱스 소비 금지)
+      - patchParagraphNodeText() — 첫 번째 hp:t 노드에 전체 텍스트, 나머지 런 비움
+      - XMLBuilder(preserveOrder) 재조립
+  → ZIP 갱신 → .hwpx 다운로드
+```
 
-- 원본 표 구조 유지
-- 원본 이미지 / BinData 참조 유지
-- 원본 섹션 수 유지
-- 원본 머리글 / 바닥글 파일 유지
-- 문단 외 레이아웃 정보 손실 최소화
+#### 문단 ID 매핑
 
-### 현재 한계
+파서(`hwpxParser.ts`)가 내보내기 plan을 함께 생성한다.
 
-- 문단 매핑은 **순서 기반**이라, 에디터에서 문단 수를 크게 바꾸면 새 구조가 완전히 직렬화되지는 않음
-- 기존 HWPX의 비텍스트 객체는 유지되지만, **새 이미지 삽입/새 표 생성**은 아직 완전 미지원
-- 강한 구조 편집보다 **기존 문서 텍스트 수정**에 최적화된 export 경로
-- `.hwp` 원본은 보존형 패치 대상이 아니므로 여전히 최소 HWPX fallback 사용
+```typescript
+// 파서 측 (parse 시점)
+buildParagraphId(path, nextParagraphIndex)
+// → "contents_sec0_xml_p3" 형태
+// 빈 문단은 ID 미부여(렌더링 skip)
+
+// HTML 측
+<p data-hwp-para-id="contents_sec0_xml_p3">텍스트</p>
+
+// 내보내기 측
+paragraphTextById.get("contents_sec0_xml_p3") → 현재 텍스트
+```
+
+`HwpxExportPlanEntry`에는 파일 경로·region·`paragraphIds[]`·`textSignature`가 담겨 있어,
+내보내기 시 ID 기반으로 정확한 텍스트를 원본 XML 문단에 써 넣는다.
+
+#### 빈 단락 인덱스 어긋남 방어 (버그 수정)
+
+원본 XML에는 줄 간격용 빈 `<hp:p>`가 존재하지만, 파서는 이 문단에 ID를 부여하지 않는다.  
+이전 구현에서는 XML 문단을 순서 그대로 순회하며 `values[i]`를 소비해, 빈 문단이 다음 텍스트 슬롯을 가로채는 버그가 있었다.
+
+```
+원본 XML: [P:"안녕", P(빈칸), P:"세상"]
+paragraphIds: ["id_0", "id_2"]   ← 빈 P는 ID 없음
+
+구(bug): i=0→P"안녕"="수정1" ✓ / i=1→P(빈)="수정2" ✗ / i=2→P"세상"="" ✗
+현(fix): 원본 텍스트 없는 단락은 valueIndex 소비 없이 skip
+```
+
+#### 텍스트 런 단일화 (버그 수정)
+
+단락 내 `<hp:run>`이 여러 개일 때(서식이 섞인 경우), 이전에는 원본 글자 수 비율로 새 텍스트를 분배했다.  
+편집 길이가 달라지면 텍스트가 중간에서 잘리거나 서식 경계와 어긋나는 문제가 있었다.  
+현재는 **첫 번째 `hp:t` 노드에 전체 텍스트를 넣고 나머지 런은 빈 문자열**로 처리한다.  
+단락 내 서식 구간 정보는 손실되지만, 텍스트 자체의 정확도가 우선이다.
+
+---
+
+### HWP fallback: `exportMinimalHwpx`
+
+HWP 바이너리(`rawZipData` 없음)는 원본 보존형 패치 대상이 아니므로 최소 HWPX를 신규 생성한다.  
+`htmlToHwpxSection()`이 에디터 HTML → HWPX XML로 변환하는 역할을 담당한다.
+
+#### 현재 생성 가능 구조
+
+| HTML 요소 | 변환 결과 | 비고 |
+|----------|----------|------|
+| `<p>`, `<h1~6>` | `<hp:p><hp:run><hp:t>` | 인라인 서식 포함 |
+| `<table>` | `<hp:tbl><hp:tr><hp:tc>` | **⚠️ 최소 구조만** |
+| `<ul>/<ol>` | 접두어 포함 `<hp:p>` | 불릿/번호 텍스트화 |
+| `<img>` | 미지원 (생략) | BinData 재패키징 미구현 |
+| 머리글/바닥글 | 본문에 병합 | 섹션 분리 미구현 |
+
+#### 알려진 한계: HWP → HWPX 표 미렌더링
+
+현재 `convertTable()`이 생성하는 HWPX 표 XML은 최소 골격만 있다.  
+HWP가 표를 렌더링하려면 `hp:cellAddr`, `hp:cellSpan`, `hp:cellSz`, `hp:cellMargin`, `hp:subList` 등  
+다수의 필수 속성/요소가 필요한데, 이것들이 없으면 **HWP가 셀 텍스트를 일반 문단으로 렌더링**해버린다.
+
+```xml
+<!-- 현재 생성 (HWP가 표로 인식 못함) -->
+<hp:tbl>
+  <hp:tr>
+    <hp:tc>
+      <hp:p><hp:run><hp:t>텍스트</hp:t></hp:run></hp:p>
+    </hp:tc>
+  </hp:tr>
+</hp:tbl>
+
+<!-- HWP가 요구하는 최소 구조 (미구현) -->
+<hp:tbl style="0" ...>
+  <hp:tr>
+    <hp:tc name="" borderFill="0" ...>
+      <hp:cellAddr colAddr="0" rowAddr="0"/>
+      <hp:cellSpan colSpan="1" rowSpan="1"/>
+      <hp:cellSz width="3685" height="850"/>
+      <hp:cellMargin left="510" right="510" top="141" bottom="141"/>
+      <hp:subList textDirection="LTRB" ...>
+        <hp:p>...</hp:p>
+      </hp:subList>
+    </hp:tc>
+  </hp:tr>
+</hp:tbl>
+```
+
+**HWPX 원본 → HWPX 내보내기는 표 구조가 보존된다.** 이 한계는 HWP 파일에만 해당한다.
+
+---
+
+### 현재 한계 요약
+
+| 항목 | HWPX 원본 | HWP 원본 |
+|------|-----------|---------|
+| 표 구조 보존 | ✅ | ❌ (텍스트만 출력) |
+| 이미지 보존 | ✅ BinData 유지 | ❌ 생략 |
+| 머리글/바닥글 | ✅ | ❌ 본문 병합 |
+| 서식(볼드 등) | ⚠️ 첫 런만 | ⚠️ 기본 적용 |
+| 새 문단 추가 | ❌ ID 없어 소실 | ❌ |
+| 새 표/이미지 삽입 | ❌ | ❌ |
