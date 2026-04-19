@@ -109,13 +109,54 @@ body {
   margin: 0.5em 0;
 }
 
-.tiptap hr.hwp-page-break,
+/* Forced page-break marker — visual separation is drawn by .page-gap-overlay;
+   the hr itself must take no layout space so the break aligns with the HWP
+   source position. Margin-top is injected at runtime by usePageBreaks. */
+.tiptap hr.hwp-page-break {
+  border: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+  display: block;
+  break-before: page;
+  page-break-before: always;
+}
 .preview-page hr.hwp-page-break {
   border: 0;
   border-top: 2px dashed #c4c4c4;
   margin: 22mm 0;
   break-before: page;
   page-break-before: always;
+}
+
+/* Visual gap between pages — covers the central PAGE_GAP_PX strip only.
+   The `::before` / `::after` shadows project outward into the prev-page
+   bottom padding and next-page top padding so each page reads as physically
+   distinct. */
+.page-gap-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: #d0d0d0;
+  pointer-events: none;
+  z-index: 5;
+}
+.page-gap-overlay::before,
+.page-gap-overlay::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  pointer-events: none;
+}
+.page-gap-overlay::before {
+  top: 0;
+  box-shadow: 0 -4px 10px rgba(0, 0, 0, 0.18);
+}
+.page-gap-overlay::after {
+  bottom: 0;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.18);
 }
 
 .tiptap table,

@@ -10,9 +10,11 @@ import { FindReplaceBar } from './FindReplaceBar';
 import { DocumentRegion } from './extensions/DocumentRegion';
 import { ImageBlock } from './extensions/ImageBlock';
 import { Paragraph } from './extensions/Paragraph';
+import { PageBreak } from './extensions/PageBreak';
 import { Table, TableCell, TableHeader, TableRow } from './extensions/Table';
 import { FindHighlight } from './extensions/FindHighlight';
 import { HwpReadonlyViewer } from './HwpReadonlyViewer';
+import { usePageBreaks } from './usePageBreaks';
 import { useDocumentStore } from '../../stores/documentStore';
 import { useWordSuggestion } from '../../hooks/useWordSuggestion';
 import { useTextRefinement } from '../../hooks/useTextRefinement';
@@ -33,6 +35,8 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
   const loadedDocRef = useRef<typeof doc>(null);
   const [saveFlash, setSaveFlash] = useState(false);
   const savingRef = useRef(false);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const [editorTick, setEditorTick] = useState(0);
 
   const editor = useEditor({
     extensions: [
@@ -48,6 +52,7 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
       TableCell,
       ImageBlock,
       DocumentRegion,
+      PageBreak,
       FindHighlight,
       Placeholder.configure({
         placeholder: '문서 내용을 편집하세요...',
@@ -60,7 +65,12 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
         class: 'tiptap',
       },
     },
+    onUpdate: () => {
+      setEditorTick((t) => t + 1);
+    },
   });
+
+  const { gaps } = usePageBreaks(pageRef, [doc, editorTick, readonlyHwp]);
 
   const { requestSuggestions, applySuggestion } = useWordSuggestion(editor, ollamaModel);
   const { requestRefinement, applyRefinement } = useTextRefinement(editor, ollamaModel);
@@ -148,7 +158,7 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
             />
             <FindReplaceBar editor={editor} />
             <div className="document-canvas flex-1">
-              <div className="document-page" style={pageStyle}>
+              <div className="document-page" style={pageStyle} ref={pageRef}>
                 {editor && (
                   <SelectionBubbleMenu
                     editor={editor}
@@ -158,6 +168,14 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
                   />
                 )}
                 <EditorContent editor={editor} />
+                {gaps.map((g, i) => (
+                  <div
+                    key={i}
+                    className="page-gap-overlay"
+                    style={{ top: `${g.y}px`, height: `${g.height}px` }}
+                    aria-hidden="true"
+                  />
+                ))}
               </div>
             </div>
             {saveFlash && (

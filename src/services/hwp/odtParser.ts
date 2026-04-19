@@ -8,6 +8,7 @@ const NS = {
   style:  'urn:oasis:names:tc:opendocument:xmlns:style:1.0',
   fo:     'urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0',
   draw:   'urn:oasis:names:tc:opendocument:xmlns:drawing:1.0',
+  svg:    'urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0',
   xlink:  'http://www.w3.org/1999/xlink',
 };
 
@@ -44,6 +45,9 @@ interface CellStyle {
 
 interface TableStyle {
   width?: string; // CSS width value, e.g. '100%' or '53.74mm'
+  align?: 'left' | 'center' | 'right' | 'margins';
+  marginLeft?: string;
+  marginRight?: string;
 }
 
 interface TableColumnStyle {
@@ -148,11 +152,18 @@ function collectStyleElements(doc: Document): StyleMaps {
       } else if (family === 'table') {
         const props = styleEl.getElementsByTagNameNS(NS.style, 'table-properties')[0];
         if (!props) continue;
+        const tblStyle: TableStyle = {};
         const rawWidth = props.getAttributeNS(NS.style, 'width');
-        if (rawWidth) {
-          const tblStyle: TableStyle = { width: tableWidthToCss(rawWidth) };
-          table.set(name, tblStyle);
+        if (rawWidth) tblStyle.width = tableWidthToCss(rawWidth);
+        const rawAlign = props.getAttributeNS(NS.table, 'align');
+        if (rawAlign === 'center' || rawAlign === 'left' || rawAlign === 'right' || rawAlign === 'margins') {
+          tblStyle.align = rawAlign;
         }
+        const tblMl = props.getAttributeNS(NS.fo, 'margin-left');
+        if (tblMl && !isZeroLength(tblMl)) tblStyle.marginLeft = tblMl;
+        const tblMr = props.getAttributeNS(NS.fo, 'margin-right');
+        if (tblMr && !isZeroLength(tblMr)) tblStyle.marginRight = tblMr;
+        if (Object.keys(tblStyle).length > 0) table.set(name, tblStyle);
       } else if (family === 'table-column') {
         const props = styleEl.getElementsByTagNameNS(NS.style, 'table-column-properties')[0];
         if (!props) continue;
@@ -286,7 +297,19 @@ function renderDrawFrame(el: Element, _styles: StyleMaps, images: Record<string,
   const src = images[href] || images[href.replace(/^\.\//, '')];
   if (!src) return '';
 
-  return `<img src="${src}" style="max-width:100%"/>`;
+  // svg:width/height on draw:frame reflect HWP's authored image size.
+  // Preserve them so embedded images render at the original dimensions
+  // instead of falling back to the raster's pixel size.
+  const style: string[] = [];
+  const width = el.getAttributeNS(NS.svg, 'width');
+  const height = el.getAttributeNS(NS.svg, 'height');
+  if (width) style.push(`width:${width}`);
+  if (height) style.push(`height:${height}`);
+
+  const attrs: string[] = [`src="${src}"`];
+  if (style.length > 0) attrs.push(`style="${style.join(';')}"`);
+
+  return `<img ${attrs.join(' ')}/>`;
 }
 
 function renderTable(tableEl: Element, styles: StyleMaps, images: Record<string, string>): string {
@@ -295,6 +318,18 @@ function renderTable(tableEl: Element, styles: StyleMaps, images: Record<string,
   // Default to width:100% — HWP tables are almost always full content-width.
   // Use the parsed ODT width only when it's narrower (< 140mm).
   const tableWidth = tblStyle?.width ?? '100%';
+
+  // Horizontal positioning: ODT table:align takes precedence, then explicit margins.
+  const tableMarginCss: string[] = [];
+  if (tblStyle?.align === 'center') {
+    tableMarginCss.push('margin-left:auto', 'margin-right:auto');
+  } else if (tblStyle?.align === 'right') {
+    tableMarginCss.push('margin-left:auto', 'margin-right:0');
+  } else {
+    if (tblStyle?.marginLeft) tableMarginCss.push(`margin-left:${tblStyle.marginLeft}`);
+    if (tblStyle?.marginRight) tableMarginCss.push(`margin-right:${tblStyle.marginRight}`);
+  }
+  const marginStyleFragment = tableMarginCss.length > 0 ? `;${tableMarginCss.join(';')}` : '';
 
   // Collect column declarations: try to get actual widths from ODT table-column styles.
   // pyhwp may emit <table:table-column number-columns-repeated="N"/> without a style-name
@@ -343,7 +378,7 @@ function renderTable(tableEl: Element, styles: StyleMaps, images: Record<string,
     ? ` data-hwp-col-widths="${colWidthsPt.map(w => w.toFixed(2)).join(',')}"`
     : '';
 
-  let html = `<table style="border-collapse:collapse;width:${tableWidth}${layoutStyle}"${colWidthsAttr}>`;
+  let html = `<table style="border-collapse:collapse;width:${tableWidth}${layoutStyle}${marginStyleFragment}"${colWidthsAttr}>`;
 
   if (totalCols > 0) {
     if (hasActualWidths) {
