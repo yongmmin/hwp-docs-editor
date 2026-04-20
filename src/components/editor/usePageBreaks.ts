@@ -21,7 +21,7 @@ import { useState, useEffect, useRef, type RefObject } from 'react';
  * TipTap's internal positioning of `.ProseMirror`).
  */
 
-const PAGE_GAP_PX = 24;
+const PAGE_GAP_PX = 32;
 const GAP_ATTR = 'data-page-gap';
 
 export interface PageGap {
