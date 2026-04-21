@@ -18,16 +18,19 @@ body {
 /* ─── A4 페이지 스타일 에디터 ─── */
 
 .document-canvas {
-  background: #d0d0d0;
+  background: #b0b3b8;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 24px 0;
-  gap: 24px;
+  padding: 32px 0;
 }
 
-.document-page {
+/* Container that holds per-page visual frames and the editor layer.
+   The editor content lives in a single continuous `.editor-layer`; the
+   individual A4 frames behind it are pure visual chrome (white bg, shadow,
+   proper page boundaries). Canvas gray shows through between frames. */
+.pages-stack {
   --page-width: 210mm;
   --page-height: 297mm;
   --page-padding-top: 20mm;
@@ -35,14 +38,38 @@ body {
   --page-padding-bottom: 20mm;
   --page-padding-left: 25mm;
   --page-content-min-height: calc(var(--page-height) - var(--page-padding-top) - var(--page-padding-bottom));
+  position: relative;
   width: var(--page-width);
-  min-height: var(--page-height);
+  flex-shrink: 0;
+}
+
+.page-frame {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: white;
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.14),
+    0 8px 24px rgba(0, 0, 0, 0.18);
+  z-index: 0;
+  pointer-events: none;
+}
+
+.editor-layer {
+  position: relative;
+  z-index: 1;
   padding: var(--page-padding-top) var(--page-padding-right) var(--page-padding-bottom) var(--page-padding-left);
+  min-height: var(--page-height);
+}
+
+/* Read-only HWP original viewer — single A4 frame, no pagination logic. */
+.readonly-page {
+  width: 210mm;
+  height: 297mm;
   background: white;
   box-shadow:
     0 1px 3px rgba(0, 0, 0, 0.12),
     0 4px 12px rgba(0, 0, 0, 0.08);
-  position: relative;
   flex-shrink: 0;
 }
 
@@ -109,7 +136,18 @@ body {
   margin: 0.5em 0;
 }
 
-.tiptap hr.hwp-page-break,
+/* Forced page-break marker — visual separation is drawn by .page-gap-overlay;
+   the hr itself must take no layout space so the break aligns with the HWP
+   source position. Margin-top is injected at runtime by usePageBreaks. */
+.tiptap hr.hwp-page-break {
+  border: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+  display: block;
+  break-before: page;
+  page-break-before: always;
+}
 .preview-page hr.hwp-page-break {
   border: 0;
   border-top: 2px dashed #c4c4c4;
@@ -289,7 +327,7 @@ body {
 }
 
 .document-canvas::-webkit-scrollbar-track {
-  background: #d0d0d0;
+  background: #b0b3b8;
 }
 
 .document-canvas::-webkit-scrollbar-thumb {
@@ -304,16 +342,24 @@ body {
 /* ─── 반응형: 작은 화면에서 페이지 축소 ─── */
 
 @media (max-width: 900px) {
-  .document-page,
+  .pages-stack,
   .preview-page {
     width: 100%;
     min-height: auto;
+  }
+
+  .page-frame {
     box-shadow: none;
   }
 
-  .document-page,
+  .editor-layer {
+    padding: 16px 20px;
+    min-height: auto;
+  }
+
   .preview-page {
     padding: 16px 20px;
+    box-shadow: none;
   }
 
   .tiptap {

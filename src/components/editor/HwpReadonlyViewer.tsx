@@ -14,7 +14,7 @@ export function HwpReadonlyViewer() {
         HWP 원본 충실도 우선 모드: 현재 문서는 읽기 전용으로 표시됩니다.
       </div>
       <div className="document-canvas flex-1">
-        <div className="document-page p-0">
+        <div className="readonly-page">
           <iframe
             title="HWP Original Readonly View"
             srcDoc={srcDoc}

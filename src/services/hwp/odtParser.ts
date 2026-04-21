@@ -8,6 +8,7 @@ const NS = {
   style:  'urn:oasis:names:tc:opendocument:xmlns:style:1.0',
   fo:     'urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0',
   draw:   'urn:oasis:names:tc:opendocument:xmlns:drawing:1.0',
+  svg:    'urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0',
   xlink:  'http://www.w3.org/1999/xlink',
 };
 
@@ -44,6 +45,9 @@ interface CellStyle {
 
 interface TableStyle {
   width?: string; // CSS width value, e.g. '100%' or '53.74mm'
+  align?: 'left' | 'center' | 'right' | 'margins';
+  marginLeft?: string;
+  marginRight?: string;
 }
 
 interface TableColumnStyle {
@@ -148,11 +152,18 @@ function collectStyleElements(doc: Document): StyleMaps {
       } else if (family === 'table') {
         const props = styleEl.getElementsByTagNameNS(NS.style, 'table-properties')[0];
         if (!props) continue;
+        const tblStyle: TableStyle = {};
         const rawWidth = props.getAttributeNS(NS.style, 'width');
-        if (rawWidth) {
-          const tblStyle: TableStyle = { width: tableWidthToCss(rawWidth) };
-          table.set(name, tblStyle);
+        if (rawWidth) tblStyle.width = tableWidthToCss(rawWidth);
+        const rawAlign = props.getAttributeNS(NS.table, 'align');
+        if (rawAlign === 'center' || rawAlign === 'left' || rawAlign === 'right' || rawAlign === 'margins') {
+          tblStyle.align = rawAlign;
         }
+        const tblMl = props.getAttributeNS(NS.fo, 'margin-left');
+        if (tblMl && !isZeroLength(tblMl)) tblStyle.marginLeft = tblMl;
+        const tblMr = props.getAttributeNS(NS.fo, 'margin-right');
+        if (tblMr && !isZeroLength(tblMr)) tblStyle.marginRight = tblMr;
+        if (Object.keys(tblStyle).length > 0) table.set(name, tblStyle);
       } else if (family === 'table-column') {
         const props = styleEl.getElementsByTagNameNS(NS.style, 'table-column-properties')[0];
         if (!props) continue;
@@ -286,7 +297,19 @@ function renderDrawFrame(el: Element, _styles: StyleMaps, images: Record<string,
   const src = images[href] || images[href.replace(/^\.\//, '')];
   if (!src) return '';
 
-  return `<img src="${src}" style="max-width:100%"/>`;
+  // svg:width/height on draw:frame reflect HWP's authored image size.
+  // Preserve them so embedded images render at the original dimensions
+  // instead of falling back to the raster's pixel size.
+  const style: string[] = [];
+  const width = el.getAttributeNS(NS.svg, 'width');
+  const height = el.getAttributeNS(NS.svg, 'height');
+  if (width) style.push(`width:${width}`);
+  if (height) style.push(`height:${height}`);
+
+  const attrs: string[] = [`src="${src}"`];
+  if (style.length > 0) attrs.push(`style="${style.join(';')}"`);
+
+  return `<img ${attrs.join(' ')}/>`;
 }
 
 function renderTable(tableEl: Element, styles: StyleMaps, images: Record<string, string>): string {
@@ -295,6 +318,18 @@ function renderTable(tableEl: Element, styles: StyleMaps, images: Record<string,
   // Default to width:100% — HWP tables are almost always full content-width.
   // Use the parsed ODT width only when it's narrower (< 140mm).
   const tableWidth = tblStyle?.width ?? '100%';
+
+  // Horizontal positioning: ODT table:align takes precedence, then explicit margins.
+  const tableMarginCss: string[] = [];
+  if (tblStyle?.align === 'center') {
+    tableMarginCss.push('margin-left:auto', 'margin-right:auto');
+  } else if (tblStyle?.align === 'right') {
+    tableMarginCss.push('margin-left:auto', 'margin-right:0');
+  } else {
+    if (tblStyle?.marginLeft) tableMarginCss.push(`margin-left:${tblStyle.marginLeft}`);
+    if (tblStyle?.marginRight) tableMarginCss.push(`margin-right:${tblStyle.marginRight}`);
+  }
+  const marginStyleFragment = tableMarginCss.length > 0 ? `;${tableMarginCss.join(';')}` : '';
 
   // Collect column declarations: try to get actual widths from ODT table-column styles.
   // pyhwp may emit <table:table-column number-columns-repeated="N"/> without a style-name
@@ -333,33 +368,32 @@ function renderTable(tableEl: Element, styles: StyleMaps, images: Record<string,
     }
   }
 
-  const totalCols = colWidthsPt.length;
+  const totalCols = colWidthsPt.length || inferTableColumnCount(rows);
   const hasActualWidths = colWidthsPt.length > 0 && colWidthsPt.every(w => w > 0);
   const layoutStyle = totalCols > 0 ? ';table-layout:fixed' : '';
+  const fragments: string[] = [];
+  let pendingRows: string[] = [];
 
-  // Emit data-hwp-col-widths when we have actual ODT widths so TipTap can build colgroup.
-  // The legacy injector in hwpParser.ts will override this with HWP binary widths if available.
-  const colWidthsAttr = hasActualWidths
-    ? ` data-hwp-col-widths="${colWidthsPt.map(w => w.toFixed(2)).join(',')}"`
-    : '';
+  const flushPendingRows = () => {
+    if (pendingRows.length === 0) return;
+    fragments.push(openTableMarkup(tableWidth, layoutStyle, marginStyleFragment, totalCols, hasActualWidths, colWidthsPt));
+    fragments.push(pendingRows.join(''));
+    fragments.push('</tbody></table>');
+    pendingRows = [];
+  };
 
-  let html = `<table style="border-collapse:collapse;width:${tableWidth}${layoutStyle}"${colWidthsAttr}>`;
-
-  if (totalCols > 0) {
-    if (hasActualWidths) {
-      html += `<colgroup>${colWidthsPt.map(w => `<col style="width:${w.toFixed(2)}pt"/>`).join('')}</colgroup>`;
-    } else {
-      const colPct = (100 / totalCols).toFixed(3) + '%';
-      html += `<colgroup>${Array(totalCols).fill(`<col style="width:${colPct}"/>`).join('')}</colgroup>`;
-    }
-  }
-
-  html += '<tbody>';
   for (const row of rows) {
-    html += renderTableRow(row, styles, images);
+    const flowHtml = renderUnwrappedFlowRow(row, totalCols, styles, images);
+    if (flowHtml !== null) {
+      flushPendingRows();
+      if (flowHtml) fragments.push(flowHtml);
+      continue;
+    }
+    pendingRows.push(renderTableRow(row, styles, images));
   }
-  html += '</tbody></table>';
-  return html;
+
+  flushPendingRows();
+  return fragments.join('');
 }
 
 function renderTableRow(rowEl: Element, styles: StyleMaps, images: Record<string, string>): string {
@@ -409,6 +443,106 @@ function renderTableRow(rowEl: Element, styles: StyleMaps, images: Record<string
 
   html += '</tr>';
   return html;
+}
+
+function openTableMarkup(
+  tableWidth: string,
+  layoutStyle: string,
+  marginStyleFragment: string,
+  totalCols: number,
+  hasActualWidths: boolean,
+  colWidthsPt: number[],
+): string {
+  // Emit data-hwp-col-widths when we have actual ODT widths so TipTap can build colgroup.
+  // The legacy injector in hwpParser.ts will override this with HWP binary widths if available.
+  const colWidthsAttr = hasActualWidths
+    ? ` data-hwp-col-widths="${colWidthsPt.map(w => w.toFixed(2)).join(',')}"`
+    : '';
+
+  let html = `<table style="border-collapse:collapse;width:${tableWidth}${layoutStyle}${marginStyleFragment}"${colWidthsAttr}>`;
+  if (totalCols > 0) {
+    if (hasActualWidths) {
+      html += `<colgroup>${colWidthsPt.map(w => `<col style="width:${w.toFixed(2)}pt"/>`).join('')}</colgroup>`;
+    } else {
+      const colPct = (100 / totalCols).toFixed(3) + '%';
+      html += `<colgroup>${Array(totalCols).fill(`<col style="width:${colPct}"/>`).join('')}</colgroup>`;
+    }
+  }
+  html += '<tbody>';
+  return html;
+}
+
+function inferTableColumnCount(rows: Element[]): number {
+  let maxCols = 0;
+
+  for (const row of rows) {
+    let cols = 0;
+    for (const child of Array.from(row.childNodes)) {
+      if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      const el = child as Element;
+      if (el.namespaceURI !== NS.table) continue;
+      if (el.localName !== 'table-cell' && el.localName !== 'covered-table-cell') continue;
+
+      const repeat = Math.max(1, parseInt(el.getAttributeNS(NS.table, 'number-columns-repeated') || '1', 10));
+      const span = Math.max(1, parseInt(el.getAttributeNS(NS.table, 'number-columns-spanned') || '1', 10));
+      cols += repeat * span;
+    }
+    if (cols > maxCols) maxCols = cols;
+  }
+
+  return maxCols;
+}
+
+function renderUnwrappedFlowRow(
+  rowEl: Element,
+  totalCols: number,
+  styles: StyleMaps,
+  images: Record<string, string>,
+): string | null {
+  const rowChildren = Array.from(rowEl.childNodes).filter((child): child is Element =>
+    child.nodeType === Node.ELEMENT_NODE &&
+    (child as Element).namespaceURI === NS.table,
+  );
+  const cells = rowChildren.filter((el) => el.localName === 'table-cell');
+  const hasOnlyCoveredCellsBesideMain =
+    rowChildren.length === cells.length ||
+    rowChildren.every((el) => el.localName === 'table-cell' || el.localName === 'covered-table-cell');
+
+  if (!hasOnlyCoveredCellsBesideMain || cells.length !== 1) return null;
+
+  const cell = cells[0];
+  const colRepeat = Math.max(1, parseInt(cell.getAttributeNS(NS.table, 'number-columns-repeated') || '1', 10));
+  const colSpan = Math.max(1, parseInt(cell.getAttributeNS(NS.table, 'number-columns-spanned') || '1', 10));
+  const rowSpan = Math.max(1, parseInt(cell.getAttributeNS(NS.table, 'number-rows-spanned') || '1', 10));
+  const effectiveSpan = colRepeat * colSpan;
+
+  if (colRepeat !== 1 || rowSpan !== 1) return null;
+  if (totalCols > 1 && effectiveSpan < totalCols) return null;
+
+  let blockCount = 0;
+  let hasNestedTable = false;
+  for (const child of Array.from(cell.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      if ((child.textContent || '').trim()) blockCount += 1;
+      continue;
+    }
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const el = child as Element;
+    if (el.namespaceURI === NS.table && el.localName === 'table') {
+      hasNestedTable = true;
+      blockCount += 1;
+      continue;
+    }
+    if (el.namespaceURI === NS.text && (el.localName === 'p' || el.localName === 'h')) {
+      blockCount += 1;
+    }
+  }
+
+  // Unwrap only rows that are effectively document-flow content, not short
+  // single-cell tables like titles or compact labels.
+  if (!hasNestedTable && blockCount < 2) return null;
+
+  return renderChildren(cell, styles, images).trim();
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────

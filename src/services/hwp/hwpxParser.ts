@@ -3,6 +3,7 @@ import { XMLParser } from 'fast-xml-parser';
 import type {
   DocumentMetadata,
   HwpxExportMeta,
+  PageLayout,
   ParsedDocument,
 } from '../../types';
 
@@ -69,6 +70,7 @@ export async function parseHwpx(buffer: ArrayBuffer): Promise<ParsedDocument> {
     buildImageSourceMap(zip),
   ]);
   const { html, exportMeta } = await extractContent(zip, { imageSources });
+  const pageLayout = await extractPageLayout(zip, exportMeta.sectionPaths);
 
   return {
     title: metadata.title || '제목 없음',
@@ -77,7 +79,72 @@ export async function parseHwpx(buffer: ArrayBuffer): Promise<ParsedDocument> {
     originalFormat: 'hwpx',
     rawZipData: buffer,
     hwpxExportMeta: exportMeta,
+    pageLayout,
   };
+}
+
+/**
+ * Extract `<hp:pagePr>` + `<hp:margin>` from the first section XML and
+ * convert HWPUNIT (1/7200 inch) values to pt (1/72 inch ⇒ divide by 100).
+ */
+async function extractPageLayout(zip: JSZip, sectionPaths: string[]): Promise<PageLayout | undefined> {
+  for (const path of sectionPaths) {
+    if (!/sec\d+\.xml$|section\d+\.xml$/i.test(path)) continue;
+    const file = zip.file(path);
+    if (!file) continue;
+
+    try {
+      const xml = await file.async('string');
+      const layout = parsePagePrFromXml(xml);
+      if (layout) return layout;
+    } catch {
+      // fall through to next section
+    }
+  }
+  return undefined;
+}
+
+function parsePagePrFromXml(xml: string): PageLayout | undefined {
+  // Tolerant regex-based extraction — we don't need the full DOM for a handful
+  // of attributes on two elements.
+  const pageMatch = xml.match(/<[^<>]*pagePr\b[^<>]*>/i);
+  if (!pageMatch) return undefined;
+
+  const pageWidth = pickNumericAttr(pageMatch[0], 'width');
+  const pageHeight = pickNumericAttr(pageMatch[0], 'height');
+  if (!pageWidth || !pageHeight) return undefined;
+
+  const marginMatch = xml.match(/<[^<>]*margin\b[^<>]*\/?>/i);
+  const marginAttrs = marginMatch ? marginMatch[0] : '';
+
+  const layout: PageLayout = {
+    widthPt: hwpUnitToPt(pageWidth),
+    heightPt: hwpUnitToPt(pageHeight),
+    paddingLeftPt: hwpUnitToPt(pickNumericAttr(marginAttrs, 'left') ?? 0),
+    paddingRightPt: hwpUnitToPt(pickNumericAttr(marginAttrs, 'right') ?? 0),
+    paddingTopPt: hwpUnitToPt(pickNumericAttr(marginAttrs, 'top') ?? 0),
+    paddingBottomPt: hwpUnitToPt(pickNumericAttr(marginAttrs, 'bottom') ?? 0),
+    headerPaddingPt: hwpUnitToPt(pickNumericAttr(marginAttrs, 'header') ?? 0),
+    footerPaddingPt: hwpUnitToPt(pickNumericAttr(marginAttrs, 'footer') ?? 0),
+  };
+
+  if (!layout.widthPt || !layout.heightPt) return undefined;
+  return layout;
+}
+
+function pickNumericAttr(source: string, name: string): number | undefined {
+  const re = new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, 'i');
+  const match = source.match(re);
+  if (!match) return undefined;
+  const n = parseFloat(match[1]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function hwpUnitToPt(value: number): number | undefined {
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  const pt = value / 100;
+  if (pt > 3000) return undefined;
+  return Number(pt.toFixed(2));
 }
 
 async function extractMetadata(zip: JSZip): Promise<DocumentMetadata> {

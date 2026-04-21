@@ -10,9 +10,11 @@ import { FindReplaceBar } from './FindReplaceBar';
 import { DocumentRegion } from './extensions/DocumentRegion';
 import { ImageBlock } from './extensions/ImageBlock';
 import { Paragraph } from './extensions/Paragraph';
+import { PageBreak } from './extensions/PageBreak';
 import { Table, TableCell, TableHeader, TableRow } from './extensions/Table';
 import { FindHighlight } from './extensions/FindHighlight';
 import { HwpReadonlyViewer } from './HwpReadonlyViewer';
+import { usePageBreaks, PAGE_GAP_PX } from './usePageBreaks';
 import { useDocumentStore } from '../../stores/documentStore';
 import { useWordSuggestion } from '../../hooks/useWordSuggestion';
 import { useTextRefinement } from '../../hooks/useTextRefinement';
@@ -33,6 +35,7 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
   const loadedDocRef = useRef<typeof doc>(null);
   const [saveFlash, setSaveFlash] = useState(false);
   const savingRef = useRef(false);
+  const pageRef = useRef<HTMLDivElement>(null);
 
   const editor = useEditor({
     extensions: [
@@ -48,6 +51,7 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
       TableCell,
       ImageBlock,
       DocumentRegion,
+      PageBreak,
       FindHighlight,
       Placeholder.configure({
         placeholder: '문서 내용을 편집하세요...',
@@ -61,6 +65,28 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
       },
     },
   });
+
+  const { gaps, totalPages, pageHeightPx } = usePageBreaks(pageRef, [doc, readonlyHwp]);
+
+  const pageTops: number[] = [];
+  for (let i = 0; i < totalPages; i += 1) {
+    if (i === 0) {
+      pageTops.push(0);
+      continue;
+    }
+    const priorGap = gaps[i - 1];
+    if (priorGap) {
+      pageTops.push(priorGap.y + priorGap.height);
+      continue;
+    }
+    const prevTop = pageTops[i - 1] ?? 0;
+    pageTops.push(prevTop + pageHeightPx + PAGE_GAP_PX);
+  }
+
+  const stackMinHeightPx =
+    pageTops.length > 0 && pageHeightPx > 0
+      ? pageTops[pageTops.length - 1] + pageHeightPx
+      : undefined;
 
   const { requestSuggestions, applySuggestion } = useWordSuggestion(editor, ollamaModel);
   const { requestRefinement, applyRefinement } = useTextRefinement(editor, ollamaModel);
@@ -148,16 +174,39 @@ export function DocumentEditor({ ollamaConnected, ollamaModel }: DocumentEditorP
             />
             <FindReplaceBar editor={editor} />
             <div className="document-canvas flex-1">
-              <div className="document-page" style={pageStyle}>
-                {editor && (
-                  <SelectionBubbleMenu
-                    editor={editor}
-                    ollamaConnected={ollamaConnected}
-                    ollamaModel={ollamaModel}
-                    onRequestRefinement={requestRefinement}
+              <div
+                className="pages-stack"
+                style={{
+                  ...pageStyle,
+                  ...(stackMinHeightPx ? { minHeight: `${stackMinHeightPx}px` } : null),
+                }}
+              >
+                {Array.from({ length: totalPages }, (_, i) => (
+                  <div
+                    key={i}
+                    className="page-frame"
+                    style={{
+                      top:
+                        pageHeightPx > 0
+                          ? `${pageTops[i] ?? i * (pageHeightPx + PAGE_GAP_PX)}px`
+                          : i === 0 ? 0 : undefined,
+                      height:
+                        pageHeightPx > 0 ? `${pageHeightPx}px` : 'var(--page-height)',
+                    }}
+                    aria-hidden="true"
                   />
-                )}
-                <EditorContent editor={editor} />
+                ))}
+                <div className="editor-layer" ref={pageRef}>
+                  {editor && (
+                    <SelectionBubbleMenu
+                      editor={editor}
+                      ollamaConnected={ollamaConnected}
+                      ollamaModel={ollamaModel}
+                      onRequestRefinement={requestRefinement}
+                    />
+                  )}
+                  <EditorContent editor={editor} />
+                </div>
               </div>
             </div>
             {saveFlash && (
